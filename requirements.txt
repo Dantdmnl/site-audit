@@ -1,0 +1,4 @@
+requests
+beautifulsoup4
+prompt_toolkit
+pypac
