@@ -1,4 +1,4 @@
-# Site Audit
+# Site Audit [Experimental]
 
 Small Python CLI for authorized web exposure checks, port scanning, and URL discovery.
 Inspired by Nuclei, Gobuster, Wappalyzer, and Nikto.
