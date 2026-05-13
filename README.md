@@ -34,7 +34,11 @@ python site_audit.py --help
 - **Atomic JSON writes**: Prevents corrupt reports on crash
 - **Port scanning**: Service enumeration on common/custom ports
 - **Proxy & custom headers**: Enterprise network support
-- **Multiple output formats**: JSON, CSV, XML
+- **Multiple output formats**: JSON, CSV, XML, HTML
+- **Branded HTML reports**: Executive summary + detailed findings
+- **Scan profiles & time budget**: Predictable runtime with quick/standard/deep
+- **Auth support**: Basic auth, bearer token, and cookies
+- **Light subdomain discovery**: Optional in discover mode
 - **Dry-run mode**: Configuration testing without requests
 - **Finding deduplication**: Eliminates duplicate results
 - **Tab completion**: Command-based interactive mode with history
@@ -60,6 +64,12 @@ python site_audit.py https://example.com --header "X-Custom:value" --proxy "http
 python site_audit.py https://example.com --output report.json
 python site_audit.py https://example.com --output report.csv --format csv
 python site_audit.py https://example.com --output report.xml --format xml
+python site_audit.py https://example.com --output report.html --format html
+python site_audit.py https://example.com --output report.html --format html --report-title "Security Report" --report-brand "Acme" --report-logo "https://example.com/logo.png"
+
+# Profiles + time budget
+python site_audit.py https://example.com --profile quick
+python site_audit.py https://example.com --profile standard --time-budget 60
 
 # Filtering & thresholds
 python site_audit.py https://example.com --min-severity HIGH
@@ -73,6 +83,14 @@ python site_audit.py https://example.com --verbose --log-file audit.log
 
 # SSL/TLS options
 python site_audit.py https://example.com --insecure  # Disable SSL verification
+
+# Auth support
+python site_audit.py https://example.com --basic-user admin --basic-pass secret
+python site_audit.py https://example.com --bearer-token "token-value"
+python site_audit.py https://example.com --cookie "session=abc; theme=dark"
+
+# Discover mode + subdomains
+python site_audit.py https://example.com --mode discover --discover-subdomains
 
 # Dry-run (test config, no requests)
 python site_audit.py https://example.com --dry-run
@@ -110,6 +128,8 @@ Examples:
 
 ```text
 set workers 40
+set profile quick
+set format html
 set min-severity HIGH
 set output results.json
 set ports http
@@ -155,5 +175,7 @@ Use `--history` to persist command history to `~/.site_audit_history`.
 - `--timeout`, `--retries`, and `--workers` help tune slow or unstable targets.
 - `--insecure` skips TLS cert validation (only for testing environments).
 - `--output` now also writes JSON reports in discover mode.
+- `--report-title`, `--report-brand`, and `--report-logo` customize HTML reports.
+- `--profile` and `--time-budget` keep scans predictable.
 - `--fail-on` makes the tool suitable for pipeline gating.
 - `--verbose` + `--log-file` adds operational logging for troubleshooting.
