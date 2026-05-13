@@ -42,6 +42,8 @@ python site_audit.py --help
 - **Dry-run mode**: Configuration testing without requests
 - **Finding deduplication**: Eliminates duplicate results
 - **Tab completion**: Command-based interactive mode with history
+- **Preference saving**: Persist defaults to user + project config files
+- **Export last report**: Re-export the most recent run without rescanning
 
 ## CLI Usage
 
@@ -94,6 +96,10 @@ python site_audit.py https://example.com --mode discover --discover-subdomains
 
 # Dry-run (test config, no requests)
 python site_audit.py https://example.com --dry-run
+
+# Export last report (no rescan)
+python site_audit.py --export-last --format html --output report.html
+python site_audit.py --export-last --format json --output report.json
 
 # via run.ps1
 .\run.ps1 https://example.com --ports http --output report.csv --format csv
@@ -150,6 +156,17 @@ audit https://example.com --fail-on MEDIUM
 - `130` — Interrupted (Ctrl-C)
 
 Use `--history` to persist command history to `~/.site_audit_history`.
+
+## Preferences
+
+- Saved to `~/.site_audit_config.json` and `./.site_audit.json` (project overrides user).
+- CLI loads saved defaults by default; use `--no-load-prefs` to ignore.
+- CLI saves successful runs by default; use `--no-save-prefs`.
+- Use `--prefs-scope user|project|both` to control where prefs are written.
+- Auth tokens, cookies, and custom headers are not saved.
+- Last report is stored at `~/.site_audit_last.json` and `./.site_audit_last.json` unless `--no-save-last` is used.
+- Use `--last-scope user|project|both` to control where last reports are written.
+- Use `--export-scope user|project|both` to choose which last report to export.
 
 ## CI / Exit Codes
 

@@ -60,6 +60,11 @@ MAX_WORKERS = 20
 RETRIES = 2
 VERIFY_SSL = True
 REPORT_SCHEMA_VERSION = "1.0"
+PREFS_VERSION = 1
+USER_PREFS_FILENAME = ".site_audit_config.json"
+PROJECT_PREFS_FILENAME = ".site_audit.json"
+USER_LAST_FILENAME = ".site_audit_last.json"
+PROJECT_LAST_FILENAME = ".site_audit_last.json"
 
 PROFILE_DEFAULTS = {
     "quick": {
@@ -94,6 +99,50 @@ IMPORTANT_PATHS = {
     "/sitemap.xml",
     "/.well-known/security.txt",
     "/security.txt",
+}
+
+PREF_KEYS = [
+    "mode",
+    "profile",
+    "format",
+    "output",
+    "min_severity",
+    "workers",
+    "timeout",
+    "time_budget",
+    "retries",
+    "insecure",
+    "fail_on",
+    "verbose",
+    "log_file",
+    "report_title",
+    "report_brand",
+    "report_logo",
+    "ports",
+    "proxy",
+    "discover_subdomains",
+]
+
+PREF_DEFAULTS = {
+    "mode": "audit",
+    "profile": "standard",
+    "format": "json",
+    "output": None,
+    "min_severity": "INFO",
+    "workers": MAX_WORKERS,
+    "timeout": TIMEOUT,
+    "time_budget": None,
+    "retries": RETRIES,
+    "insecure": False,
+    "fail_on": None,
+    "verbose": False,
+    "log_file": None,
+    "report_title": "Security Exposure Report",
+    "report_brand": "site-audit",
+    "report_logo": None,
+    "ports": None,
+    "proxy": None,
+    "discover_subdomains": False,
 }
 TEXTUAL_CONTENT_TYPES = (
     "text/",
@@ -139,6 +188,7 @@ INTERACTIVE_COMMANDS = [
     "scan",
     "audit",
     "discover",
+    "export",
     "set",
     "unset",
     "show",
@@ -194,6 +244,12 @@ INTERACTIVE_FLAGS = [
     "--report-title",
     "--report-brand",
     "--report-logo",
+    "--export-scope",
+    "--no-load-prefs",
+    "--no-save-prefs",
+    "--prefs-scope",
+    "--no-save-last",
+    "--last-scope",
     "--basic-user",
     "--basic-pass",
     "--bearer-token",
@@ -919,6 +975,210 @@ def normalize_output_target(output_path: str | None, output_format: str) -> tupl
             return f"report.{base}", base
         return f"{output_path}.{output_format}", output_format
     return output_path, output_format
+
+
+def _prefs_user_path() -> str:
+    return _os.path.join(_os.path.expanduser("~"), USER_PREFS_FILENAME)
+
+
+def _prefs_project_path() -> str:
+    return _os.path.join(_os.getcwd(), PROJECT_PREFS_FILENAME)
+
+
+def _last_user_path() -> str:
+    return _os.path.join(_os.path.expanduser("~"), USER_LAST_FILENAME)
+
+
+def _last_project_path() -> str:
+    return _os.path.join(_os.getcwd(), PROJECT_LAST_FILENAME)
+
+
+def _load_prefs_file(path: str) -> dict:
+    if not _os.path.isfile(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return data
+
+
+def _merge_prefs(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    defaults = dict(base.get("defaults", {}))
+    defaults.update(override.get("defaults", {}) or {})
+    merged["defaults"] = defaults
+    if "version" in override:
+        merged["version"] = override["version"]
+    return merged
+
+
+def load_preferences() -> dict:
+    prefs: dict = {"version": PREFS_VERSION, "defaults": {}}
+    prefs = _merge_prefs(prefs, _load_prefs_file(_prefs_user_path()))
+    prefs = _merge_prefs(prefs, _load_prefs_file(_prefs_project_path()))
+    return prefs
+
+
+def _normalize_pref_defaults(values: dict) -> dict:
+    normalized: dict = {}
+    for key in PREF_KEYS:
+        if key not in values:
+            continue
+        value = values[key]
+        if value == PREF_DEFAULTS.get(key):
+            continue
+        normalized[key] = value
+    return normalized
+
+
+def apply_preferences_to_args(args: argparse.Namespace, prefs: dict) -> None:
+    defaults = prefs.get("defaults", {}) or {}
+    for key in PREF_KEYS:
+        if key not in defaults:
+            continue
+        if not hasattr(args, key):
+            continue
+        current = getattr(args, key)
+        if current == PREF_DEFAULTS.get(key):
+            setattr(args, key, defaults[key])
+
+
+def apply_preferences_to_state(state: InteractiveState, prefs: dict) -> None:
+    defaults = prefs.get("defaults", {}) or {}
+    for key in PREF_KEYS:
+        if key in state and key in defaults:
+            if state[key] == PREF_DEFAULTS.get(key):
+                state[key] = defaults[key]
+
+
+def update_preferences_from_state(prefs: dict, state: InteractiveState) -> dict:
+    defaults = {key: state.get(key) for key in PREF_KEYS if key in state}
+    prefs["defaults"] = _normalize_pref_defaults(defaults)
+    prefs["version"] = PREFS_VERSION
+    return prefs
+
+
+def update_preferences_from_args(prefs: dict, args: argparse.Namespace) -> dict:
+    defaults = {}
+    for key in PREF_KEYS:
+        if hasattr(args, key):
+            defaults[key] = getattr(args, key)
+    prefs["defaults"] = _normalize_pref_defaults(defaults)
+    prefs["version"] = PREFS_VERSION
+    return prefs
+
+
+def save_preferences(prefs: dict, scope: str) -> None:
+    payload = {
+        "version": PREFS_VERSION,
+        "defaults": prefs.get("defaults", {}) or {},
+    }
+    if scope in ("user", "both"):
+        write_json_atomic(_prefs_user_path(), payload)
+    if scope in ("project", "both"):
+        write_json_atomic(_prefs_project_path(), payload)
+
+
+def _load_last_report(scope: str) -> dict | None:
+    candidates: list[str] = []
+    if scope == "user":
+        candidates = [_last_user_path()]
+    elif scope == "project":
+        candidates = [_last_project_path()]
+    else:
+        candidates = [_last_project_path(), _last_user_path()]
+
+    for path in candidates:
+        report = _load_prefs_file(path)
+        if report:
+            return report
+    return None
+
+
+def _findings_from_report(report: dict) -> list[Finding]:
+    findings: list[Finding] = []
+    for item in report.get("findings", []) or []:
+        if isinstance(item, dict):
+            findings.append(Finding(**item))
+    return findings
+
+
+def save_last_report(report: dict, scope: str) -> None:
+    if scope in ("user", "both"):
+        write_json_atomic(_last_user_path(), report)
+    if scope in ("project", "both"):
+        write_json_atomic(_last_project_path(), report)
+
+
+def export_last_report(
+    output_path: str,
+    output_format: str,
+    scope: str,
+    *,
+    report_title: str,
+    report_brand: str,
+    report_logo: str | None,
+) -> int:
+    report = _load_last_report(scope)
+    if not report:
+        print("[ERROR] No previous report found to export")
+        return 1
+
+    mode = report.get("mode", "audit")
+    target = report.get("target", "-")
+    settings = report.get("settings", {})
+    platforms = report.get("platforms", [])
+    findings = _findings_from_report(report)
+    discover_result = report.get("result")
+    started_at = None
+    finished_at = None
+    duration_seconds = report.get("duration_seconds")
+    if report.get("started_at"):
+        started_at = datetime.fromisoformat(report["started_at"])
+    if report.get("finished_at"):
+        finished_at = datetime.fromisoformat(report["finished_at"])
+
+    if mode == "discover" and output_format not in ("json", "html"):
+        print("[ERROR] Discover reports can only export to json or html")
+        return 1
+
+    if output_format == "json":
+        write_json_atomic(output_path, report)
+        print(f"JSON report written to {output_path}")
+        return 0
+    if output_format == "csv":
+        write_csv(output_path, findings)
+        print(f"CSV report written to {output_path}")
+        return 0
+    if output_format == "xml":
+        write_xml(output_path, findings, target)
+        print(f"XML report written to {output_path}")
+        return 0
+    if output_format == "html":
+        write_html_report(
+            output_path,
+            mode=mode,
+            target=target,
+            platforms=platforms,
+            settings=settings,
+            findings=findings,
+            discover_result=discover_result,
+            started_at=started_at,
+            finished_at=finished_at,
+            duration_seconds=duration_seconds,
+            report_title=report_title,
+            report_brand=report_brand,
+            report_logo=report_logo,
+        )
+        print(f"HTML report written to {output_path}")
+        return 0
+
+    print(f"[ERROR] Unsupported format: {output_format}")
+    return 1
 
 
 def _html_escape(value: object) -> str:
@@ -1938,6 +2198,18 @@ def parse_args() -> argparse.Namespace:
         help="Enable command history in interactive mode",
     )
     parser.add_argument(
+        "--no-load-prefs", action="store_true",
+        help="Ignore saved preferences",
+    )
+    parser.add_argument(
+        "--no-save-prefs", action="store_true",
+        help="Do not persist CLI options to preference files",
+    )
+    parser.add_argument(
+        "--prefs-scope", choices=["user", "project", "both"], default="both",
+        help="Where to save preferences (default: both)",
+    )
+    parser.add_argument(
         "--ports", metavar="TYPE|PORTS", default=None,
         help="Scan ports: 'http', 'https', 'services', or comma-separated list (e.g. 80,443,8080)",
     )
@@ -1970,6 +2242,14 @@ def parse_args() -> argparse.Namespace:
         help="Output format for --output file (default: json)",
     )
     parser.add_argument(
+        "--export-last", action="store_true",
+        help="Export the last saved report without running a scan",
+    )
+    parser.add_argument(
+        "--export-scope", choices=["user", "project", "both"], default="both",
+        help="Where to load the last report from (default: both)",
+    )
+    parser.add_argument(
         "--report-title", metavar="TEXT", default="Security Exposure Report",
         help="Custom title for HTML report",
     )
@@ -1988,6 +2268,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--discover-subdomains", action="store_true",
         help="Discover common subdomains (discover mode only)",
+    )
+    parser.add_argument(
+        "--no-save-last", action="store_true",
+        help="Do not persist the last report for export",
+    )
+    parser.add_argument(
+        "--last-scope", choices=["user", "project", "both"], default="both",
+        help="Where to save the last report (default: both)",
     )
     return parser.parse_args()
 
@@ -2105,27 +2393,39 @@ def run_scan(args: argparse.Namespace) -> int:
                     discover_subdomains_flag=getattr(args, "discover_subdomains", False),
                     subdomain_prefixes=DISCOVER_SUBDOMAIN_PREFIXES,
                 )
+                finished_time = datetime.now(timezone.utc)
+                duration_seconds = (finished_time - start_time).total_seconds()
+                settings_payload = {
+                    "profile": profile,
+                    "workers": workers,
+                    "timeout": timeout,
+                    "retries": retries,
+                    "verify_ssl": config.verify_ssl,
+                    "min_severity": args.min_severity,
+                    "fail_on": fail_on,
+                    "time_budget": time_budget_seconds,
+                    "proxy": config.proxy,
+                    "custom_headers": len(config.custom_headers),
+                }
+                report_payload = {
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "target": base_url,
+                    "timestamp": finished_time.isoformat(),
+                    "mode": "discover",
+                    "settings": settings_payload,
+                    "result": result,
+                    "started_at": start_time.isoformat(),
+                    "finished_at": finished_time.isoformat(),
+                    "duration_seconds": duration_seconds,
+                }
                 if output_path:
                     if output_format == "html":
-                        finished_time = datetime.now(timezone.utc)
-                        duration_seconds = (finished_time - start_time).total_seconds()
                         write_html_report(
                             output_path,
                             mode="discover",
                             target=base_url,
                             platforms=[],
-                            settings={
-                                "profile": profile,
-                                "workers": workers,
-                                "timeout": timeout,
-                                "retries": retries,
-                                "verify_ssl": config.verify_ssl,
-                                "min_severity": args.min_severity,
-                                "fail_on": fail_on,
-                                "time_budget": time_budget_seconds,
-                                "proxy": config.proxy,
-                                "custom_headers": len(config.custom_headers),
-                            },
+                            settings=settings_payload,
                             discover_result=result,
                             started_at=start_time,
                             finished_at=finished_time,
@@ -2138,25 +2438,13 @@ def run_scan(args: argparse.Namespace) -> int:
                     else:
                         if output_format not in ("json", "html"):
                             print(c("INFO", "[INFO] Discover mode supports json/html; writing JSON output"))
-                        report = {
-                            "schema_version": REPORT_SCHEMA_VERSION,
-                            "target": base_url,
-                            "timestamp": datetime.now(timezone.utc).isoformat(),
-                            "mode": "discover",
-                            "settings": {
-                                "profile": profile,
-                                "workers": workers,
-                                "timeout": timeout,
-                                "retries": retries,
-                                "verify_ssl": config.verify_ssl,
-                                "time_budget": time_budget_seconds,
-                                "proxy": config.proxy,
-                                "custom_headers": len(config.custom_headers),
-                            },
-                            "result": result,
-                        }
-                        write_json_atomic(output_path, report)
+                        write_json_atomic(output_path, report_payload)
                         print(f"JSON report written to {output_path}")
+                if not getattr(args, "no_save_last", False):
+                    try:
+                        save_last_report(report_payload, getattr(args, "last_scope", "both"))
+                    except OSError:
+                        print("[WARN] Failed to save last report")
                 LOGGER.info("Discover mode finished")
                 return 0
 
@@ -2250,28 +2538,36 @@ def run_scan(args: argparse.Namespace) -> int:
         print_findings(filtered)
         print_summary(filtered)
 
+        finished_time = datetime.now(timezone.utc)
+        duration_seconds = (finished_time - start_time).total_seconds()
+        settings_payload = {
+            "profile": profile,
+            "workers": workers,
+            "timeout": timeout,
+            "retries": retries,
+            "verify_ssl": config.verify_ssl,
+            "min_severity": args.min_severity,
+            "fail_on": fail_on,
+            "time_budget": time_budget_seconds,
+            "proxy": config.proxy,
+            "custom_headers": len(config.custom_headers),
+        }
+        report_payload = {
+            "schema_version": REPORT_SCHEMA_VERSION,
+            "target": base_url,
+            "timestamp": finished_time.isoformat(),
+            "mode": "audit",
+            "platforms": platforms,
+            "settings": settings_payload,
+            "findings": [asdict(f) for f in filtered],
+            "started_at": start_time.isoformat(),
+            "finished_at": finished_time.isoformat(),
+            "duration_seconds": duration_seconds,
+        }
+
         if output_path:
             if output_format == "json":
-                report = {
-                    "schema_version": REPORT_SCHEMA_VERSION,
-                    "target": base_url,
-                    "timestamp": datetime.now(timezone.utc).isoformat(),
-                    "platforms": platforms,
-                    "settings": {
-                        "profile": profile,
-                        "workers": workers,
-                        "timeout": timeout,
-                        "retries": retries,
-                        "verify_ssl": config.verify_ssl,
-                        "min_severity": args.min_severity,
-                        "fail_on": fail_on,
-                        "time_budget": time_budget_seconds,
-                        "proxy": config.proxy,
-                        "custom_headers": len(config.custom_headers),
-                    },
-                    "findings": [asdict(f) for f in filtered],
-                }
-                write_json_atomic(output_path, report)
+                write_json_atomic(output_path, report_payload)
                 print(f"JSON report written to {output_path}")
             elif output_format == "csv":
                 write_csv(output_path, filtered)
@@ -2280,25 +2576,12 @@ def run_scan(args: argparse.Namespace) -> int:
                 write_xml(output_path, filtered, base_url)
                 print(f"XML report written to {output_path}")
             elif output_format == "html":
-                finished_time = datetime.now(timezone.utc)
-                duration_seconds = (finished_time - start_time).total_seconds()
                 write_html_report(
                     output_path,
                     mode="audit",
                     target=base_url,
                     platforms=platforms,
-                    settings={
-                        "profile": profile,
-                        "workers": workers,
-                        "timeout": timeout,
-                        "retries": retries,
-                        "verify_ssl": config.verify_ssl,
-                        "min_severity": args.min_severity,
-                        "fail_on": fail_on,
-                        "time_budget": time_budget_seconds,
-                        "proxy": config.proxy,
-                        "custom_headers": len(config.custom_headers),
-                    },
+                    settings=settings_payload,
                     findings=filtered,
                     started_at=start_time,
                     finished_at=finished_time,
@@ -2308,6 +2591,12 @@ def run_scan(args: argparse.Namespace) -> int:
                     report_logo=report_logo,
                 )
                 print(f"HTML report written to {output_path}")
+
+        if not getattr(args, "no_save_last", False):
+            try:
+                save_last_report(report_payload, getattr(args, "last_scope", "both"))
+            except OSError:
+                print("[WARN] Failed to save last report")
 
         if fail_on and has_findings_at_or_above(all_findings, fail_on):
             LOGGER.warning("Fail-on threshold hit: %s", fail_on)
@@ -2322,7 +2611,8 @@ Commands:
   scan <url> [options]      run scan using saved defaults + optional overrides
   audit <url> [options]     same as scan, forced --mode audit
   discover <url> [options]  same as scan, forced --mode discover
-  set <key> <value>         persist default option (workers, timeout, ...)
+    export <file> [options]   export last report to file
+    set <key> <value>         persist default option (workers, timeout, ...)
   unset <key>               remove optional default (output, fail-on, log-file)
   show config               print current interactive defaults
   history                   show current session command history
@@ -2335,6 +2625,8 @@ Common keys for 'set':
     retries, insecure, fail-on, verbose, log-file, output,
     report-title, report-brand, report-logo
 
+Defaults are saved to ~/.site_audit_config.json and ./.site_audit.json
+
 Examples:
   set workers 40
     set profile quick
@@ -2343,6 +2635,7 @@ Examples:
   show config
   scan https://example.com
   discover https://example.com --output discover.json
+    export report.html --format html
   audit https://example.com --fail-on HIGH
 """.strip()
 
@@ -2538,6 +2831,9 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--log-file", metavar="FILE", default=None)
     parser.add_argument("--history", action="store_true")
+    parser.add_argument("--no-load-prefs", action="store_true")
+    parser.add_argument("--no-save-prefs", action="store_true")
+    parser.add_argument("--prefs-scope", choices=["user", "project", "both"], default="both")
     parser.add_argument("--basic-user", metavar="USER", default=None)
     parser.add_argument("--basic-pass", metavar="PASS", default=None)
     parser.add_argument("--bearer-token", metavar="TOKEN", default=None)
@@ -2546,6 +2842,19 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
     parser.add_argument("--report-brand", metavar="TEXT", default="site-audit")
     parser.add_argument("--report-logo", metavar="URL", default=None)
     parser.add_argument("--discover-subdomains", action="store_true")
+    parser.add_argument("--no-save-last", action="store_true")
+    parser.add_argument("--last-scope", choices=["user", "project", "both"], default="both")
+
+    export_parser = argparse.ArgumentParser(exit_on_error=False, add_help=False)
+    export_parser.add_argument("output")
+    export_parser.add_argument("--format", choices=["json", "csv", "xml", "html"], default="html")
+    export_parser.add_argument("--export-scope", choices=["user", "project", "both"], default="both")
+    export_parser.add_argument("--report-title", metavar="TEXT", default="Security Exposure Report")
+    export_parser.add_argument("--report-brand", metavar="TEXT", default="site-audit")
+    export_parser.add_argument("--report-logo", metavar="URL", default=None)
+
+    prefs = load_preferences()
+    prefs_scope = "both"
 
     state: InteractiveState = {
         "mode": "audit",
@@ -2565,6 +2874,7 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
         "report_brand": "site-audit",
         "report_logo": None,
     }
+    apply_preferences_to_state(state, prefs)
     history: list[str] = []
     history_path = _os.path.join(_os.path.expanduser("~"), ".site_audit_history")
     session = None
@@ -2681,6 +2991,36 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
                     print(f"{idx:>4}: {entry}")
             continue
 
+        if command == "export":
+            if len(tokens) < 2:
+                print("Usage: export <file> [--format html|json|csv|xml]")
+                continue
+            export_parser.set_defaults(
+                format=state["format"],
+                report_title=state["report_title"],
+                report_brand=state["report_brand"],
+                report_logo=state["report_logo"],
+            )
+            try:
+                export_args = export_parser.parse_args(tokens[1:])
+            except (argparse.ArgumentError, SystemExit) as exc:
+                print(f"Parse error: {exc}")
+                continue
+            output_path, output_format = normalize_output_target(export_args.output, export_args.format)
+            if not output_path:
+                print("[ERROR] Export requires an output path")
+                continue
+            exit_code = export_last_report(
+                output_path,
+                output_format,
+                export_args.export_scope,
+                report_title=export_args.report_title,
+                report_brand=export_args.report_brand,
+                report_logo=export_args.report_logo,
+            )
+            print(f"Export exit code: {exit_code}")
+            continue
+
         if command == "set":
             if len(tokens) < 3:
                 print("Usage: set <key> <value>")
@@ -2693,6 +3033,11 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
                 print(f"Set error: {exc}")
                 continue
             print(f"Set {normalized} = {value}")
+            try:
+                prefs = update_preferences_from_state(prefs, state)
+                save_preferences(prefs, prefs_scope)
+            except OSError:
+                print("[WARN] Failed to save preferences")
             continue
 
         if command == "unset":
@@ -2705,6 +3050,11 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
                 print(f"Unset error: {exc}")
                 continue
             print(f"Unset {normalized}")
+            try:
+                prefs = update_preferences_from_state(prefs, state)
+                save_preferences(prefs, prefs_scope)
+            except OSError:
+                print("[WARN] Failed to save preferences")
             continue
 
         if command in ("scan", "audit", "discover"):
@@ -2753,16 +3103,44 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
 
 def main() -> None:
     args = parse_args()
+    prefs = load_preferences()
+
+    if getattr(args, "export_last", False):
+        if not args.output:
+            print("[ERROR] --output is required when using --export-last")
+            raise SystemExit(1)
+        output_path, output_format = normalize_output_target(args.output, args.format)
+        if not output_path:
+            print("[ERROR] --output is required when using --export-last")
+            raise SystemExit(1)
+        code = export_last_report(
+            output_path,
+            output_format,
+            getattr(args, "export_scope", "both"),
+            report_title=args.report_title,
+            report_brand=args.report_brand,
+            report_logo=args.report_logo,
+        )
+        raise SystemExit(code)
 
     if args.url is None:
         interactive_mode(default_workers=args.workers, history_enabled=args.history)
         return
+
+    if not getattr(args, "no_load_prefs", False):
+        apply_preferences_to_args(args, prefs)
 
     try:
         code = run_scan(args)
     except KeyboardInterrupt:
         print("\nInterrupted.")
         code = 130
+    if not getattr(args, "no_save_prefs", False) and code in (0, 2):
+        prefs = update_preferences_from_args(prefs, args)
+        try:
+            save_preferences(prefs, getattr(args, "prefs_scope", "both"))
+        except OSError:
+            print("[WARN] Failed to save preferences")
     raise SystemExit(code)
 
 
