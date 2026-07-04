@@ -1,4 +1,4 @@
-# Site Audit [Experimental]
+# Site Audit v1.0.0 [Experimental]
 
 Small Python CLI for authorized web exposure checks, port scanning, and URL discovery.
 Inspired by Nuclei, Gobuster, Wappalyzer, and Nikto.
@@ -48,6 +48,9 @@ python site_audit.py --help
 ## CLI Usage
 
 ```powershell
+# Version
+python site_audit.py --version
+
 # Basic audit
 python site_audit.py https://example.com
 
@@ -103,6 +106,12 @@ python site_audit.py --export-last --format json --output report.json
 
 # via run.ps1
 .\run.ps1 https://example.com --ports http --output report.csv --format csv
+```
+
+## Tests
+
+```powershell
+.\.venv\Scripts\python.exe -m unittest discover -s tests
 ```
 
 ## Interactive Mode

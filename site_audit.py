@@ -31,7 +31,7 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import TypedDict
@@ -59,6 +59,8 @@ TIMEOUT = 10
 MAX_WORKERS = 20
 RETRIES = 2
 VERIFY_SSL = True
+APP_NAME = "site-audit"
+__version__ = "1.0.0"
 REPORT_SCHEMA_VERSION = "1.0"
 PREFS_VERSION = 1
 USER_PREFS_FILENAME = ".site_audit_config.json"
@@ -183,6 +185,9 @@ DISCOVER_SUBDOMAIN_PREFIXES = [
 ]
 
 LOGGER = logging.getLogger("site-audit")
+
+HEADER_NAME_RE = re.compile(r"^[!#$%&'*+\-.^_`|~0-9A-Za-z]+$")
+MAX_PORT_COUNT = 256
 
 INTERACTIVE_COMMANDS = [
     "scan",
@@ -519,12 +524,17 @@ class BodyFingerprint:
     content_type: str
     hash: str
     length: int
+    visible_hash: str = ""
+    visible_length: int = 0
 
 
 def setup_logging(verbose: bool, log_file: str | None) -> None:
     level = logging.DEBUG if verbose else logging.WARNING
     handlers: list[logging.Handler] = [logging.StreamHandler()]
     if log_file:
+        log_dir = _os.path.dirname(_os.path.abspath(log_file))
+        if log_dir:
+            _os.makedirs(log_dir, exist_ok=True)
         handlers.append(logging.FileHandler(log_file, encoding="utf-8"))
 
     logging.basicConfig(
@@ -653,13 +663,25 @@ def get_ports_for_url(base_url: str, scan_type: str = "http") -> list[int]:
         return COMMON_PORTS["https"]
     elif scan_type == "services":
         return COMMON_PORTS["services"]
-    elif "," in scan_type:
-        try:
-            return [int(p.strip()) for p in scan_type.split(",")]
-        except ValueError:
-            return COMMON_PORTS["http"] if scheme == "http" else COMMON_PORTS["https"]
+    elif "," in scan_type or scan_type.strip().isdigit():
+        ports: list[int] = []
+        for raw_port in scan_type.split(","):
+            raw_port = raw_port.strip()
+            if not raw_port:
+                raise ValueError("empty port in comma-separated port list")
+            try:
+                port = int(raw_port)
+            except ValueError:
+                raise ValueError(f"invalid port: {raw_port}") from None
+            if port < 1 or port > 65535:
+                raise ValueError(f"port out of range: {port}")
+            if port not in ports:
+                ports.append(port)
+        if len(ports) > MAX_PORT_COUNT:
+            raise ValueError(f"port list is limited to {MAX_PORT_COUNT} entries")
+        return ports
     else:
-        return COMMON_PORTS["http"] if scheme == "http" else COMMON_PORTS["https"]
+        raise ValueError("ports must be one of http, https, services, or a comma-separated list")
 
 
 # ---------------------------------------------------------------------------
@@ -747,6 +769,14 @@ def normalize_body_text(text: str) -> str:
     return cleaned[:200_000]
 
 
+def normalize_visible_text(html_text: str) -> str:
+    soup = BeautifulSoup(html_text, "html.parser")
+    for tag in soup(("script", "style", "noscript", "template")):
+        tag.decompose()
+    cleaned = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip().lower()
+    return cleaned[:50_000]
+
+
 def body_fingerprint(resp: requests.Response) -> BodyFingerprint | None:
     if not should_inspect_body(resp):
         return None
@@ -755,7 +785,15 @@ def body_fingerprint(resp: requests.Response) -> BodyFingerprint | None:
     if not normalized:
         return None
     digest = hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
-    return BodyFingerprint(content_type=content_type, hash=digest, length=len(normalized))
+    visible = normalize_visible_text(resp.text) if "html" in content_type else ""
+    visible_digest = hashlib.sha256(visible.encode("utf-8", errors="ignore")).hexdigest() if visible else ""
+    return BodyFingerprint(
+        content_type=content_type,
+        hash=digest,
+        length=len(normalized),
+        visible_hash=visible_digest,
+        visible_length=len(visible),
+    )
 
 
 def is_soft_404(resp: requests.Response, profiles: list[BodyFingerprint]) -> bool:
@@ -764,6 +802,13 @@ def is_soft_404(resp: requests.Response, profiles: list[BodyFingerprint]) -> boo
         return False
     for profile in profiles:
         if fingerprint.content_type == profile.content_type and fingerprint.hash == profile.hash:
+            return True
+        if (
+            fingerprint.content_type == profile.content_type
+            and fingerprint.visible_hash
+            and fingerprint.visible_hash == profile.visible_hash
+            and abs(fingerprint.visible_length - profile.visible_length) <= 200
+        ):
             return True
     return False
 
@@ -905,14 +950,19 @@ def has_findings_at_or_above(findings: list[Finding], severity: str) -> bool:
     return any(severity_index(f.severity) <= threshold for f in findings)
 
 
-def write_json_atomic(output_path: str, payload: dict) -> None:
+def write_text_atomic(
+    output_path: str,
+    content: str,
+    *,
+    newline: str | None = None,
+    encoding: str = "utf-8",
+) -> None:
     directory = _os.path.dirname(_os.path.abspath(output_path)) or "."
     _os.makedirs(directory, exist_ok=True)
     fd, tmp_path = tempfile.mkstemp(prefix=".site-audit-", suffix=".tmp", dir=directory)
     try:
-        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump(payload, fh, indent=2, sort_keys=True)
-            fh.write("\n")
+        with _os.fdopen(fd, "w", encoding=encoding, newline=newline) as fh:
+            fh.write(content)
         _os.replace(tmp_path, output_path)
     except Exception:
         try:
@@ -922,31 +972,31 @@ def write_json_atomic(output_path: str, payload: dict) -> None:
         raise
 
 
+def write_json_atomic(output_path: str, payload: dict) -> None:
+    content = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    write_text_atomic(output_path, content)
+
+
 def write_csv(output_path: str, findings: list[Finding]) -> None:
     """Write findings to CSV file."""
-    directory = _os.path.dirname(_os.path.abspath(output_path)) or "."
-    _os.makedirs(directory, exist_ok=True)
-    
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        fieldnames = ["severity", "category", "title", "detail", "url", "status_code"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        writer.writeheader()
-        for finding in findings:
-            writer.writerow({
-                "severity": finding.severity,
-                "category": finding.category,
-                "title": finding.title,
-                "detail": finding.detail,
-                "url": finding.url,
-                "status_code": finding.status_code or "",
-            })
+    buffer = io.StringIO(newline="")
+    fieldnames = ["severity", "category", "title", "detail", "url", "status_code"]
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames)
+    writer.writeheader()
+    for finding in findings:
+        writer.writerow({
+            "severity": finding.severity,
+            "category": finding.category,
+            "title": finding.title,
+            "detail": finding.detail,
+            "url": finding.url,
+            "status_code": finding.status_code or "",
+        })
+    write_text_atomic(output_path, buffer.getvalue(), newline="")
 
 
 def write_xml(output_path: str, findings: list[Finding], target: str) -> None:
     """Write findings to XML file."""
-    directory = _os.path.dirname(_os.path.abspath(output_path)) or "."
-    _os.makedirs(directory, exist_ok=True)
-    
     root = ET.Element("audit")
     root.set("target", target)
     root.set("timestamp", datetime.now(timezone.utc).isoformat())
@@ -961,8 +1011,36 @@ def write_xml(output_path: str, findings: list[Finding], target: str) -> None:
         if finding.status_code:
             ET.SubElement(item, "status_code").text = str(finding.status_code)
     
+    buffer = io.BytesIO()
     tree = ET.ElementTree(root)
-    tree.write(output_path, encoding="utf-8", xml_declaration=True)
+    tree.write(buffer, encoding="utf-8", xml_declaration=True)
+    write_text_atomic(output_path, buffer.getvalue().decode("utf-8"))
+
+
+def parse_custom_headers(header_values: list[str]) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for header_str in header_values:
+        if ":" not in header_str:
+            raise ValueError(f"Invalid header {header_str!r}; expected KEY:VALUE")
+        key, val = header_str.split(":", 1)
+        key = key.strip()
+        if not key or not HEADER_NAME_RE.fullmatch(key):
+            raise ValueError(f"Invalid header name {key!r}")
+        if "\r" in val or "\n" in val:
+            raise ValueError(f"Invalid header value for {key!r}")
+        headers[key] = val.strip()
+    return headers
+
+
+def validate_proxy_url(proxy: str | None) -> str | None:
+    if not proxy:
+        return None
+    parsed = urlparse(proxy)
+    if parsed.scheme not in ("http", "https", "socks4", "socks5"):
+        raise ValueError("proxy must use http, https, socks4, or socks5")
+    if not parsed.hostname:
+        raise ValueError("proxy URL must include a hostname")
+    return proxy
 
 
 def normalize_output_target(output_path: str | None, output_format: str) -> tuple[str | None, str]:
@@ -1407,15 +1485,12 @@ def write_html_report(
             lines.append("      </table>")
             lines.append("    </section>")
 
-    lines.append("    <div class=\"foot\">Generated by site-audit. Use only on targets you own or have explicit permission to test.</div>")
+    lines.append(f"    <div class=\"foot\">Generated by {_html_escape(APP_NAME)} v{_html_escape(__version__)}. Use only on targets you own or have explicit permission to test.</div>")
     lines.append("  </div>")
     lines.append("</body>")
     lines.append("</html>")
 
-    directory = _os.path.dirname(_os.path.abspath(output_path)) or "."
-    _os.makedirs(directory, exist_ok=True)
-    with open(output_path, "w", encoding="utf-8") as fh:
-        fh.write("\n".join(lines))
+    write_text_atomic(output_path, "\n".join(lines))
 
 
 class InteractiveState(TypedDict):
@@ -1813,10 +1888,17 @@ def run_endpoint_audit(
     truncated = False
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures: dict = {}
-        for path, sev, desc in tasks:
+        task_iter = iter(tasks)
+
+        def submit_next() -> bool:
+            nonlocal truncated
             if time_budget and time_budget.exhausted():
                 truncated = True
-                break
+                return False
+            try:
+                path, sev, desc = next(task_iter)
+            except StopIteration:
+                return False
             future = pool.submit(
                 probe_path,
                 session_pool,
@@ -1828,23 +1910,48 @@ def run_endpoint_audit(
                 soft_404_profiles,
             )
             futures[future] = path
+            return True
 
-        for future in as_completed(futures):
+        for _ in range(workers):
+            if not submit_next():
+                break
+
+        while futures:
             if time_budget and time_budget.exhausted():
                 truncated = True
+                for future in futures:
+                    future.cancel()
                 break
-            try:
-                result = future.result()
-            except Exception as exc:
-                errors += 1
-                result = Finding(
-                    severity="INFO", category="endpoint",
-                    title="Probe task failed",
-                    detail=str(exc),
-                    url=urljoin(base_url, futures[future].lstrip("/")),
-                )
-            if result is not None:
-                findings.append(result)
+
+            done, _ = wait(futures, timeout=0.25, return_when=FIRST_COMPLETED)
+            if not done:
+                continue
+
+            for future in done:
+                path = futures.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    errors += 1
+                    result = Finding(
+                        severity="INFO", category="endpoint",
+                        title="Probe task failed",
+                        detail=str(exc),
+                        url=urljoin(base_url, path.lstrip("/")),
+                    )
+                if result is not None:
+                    findings.append(result)
+
+                if not submit_next() and futures:
+                    if time_budget and time_budget.exhausted():
+                        truncated = True
+                        for pending in futures:
+                            pending.cancel()
+                        break
+            if truncated:
+                break
 
     if errors:
         findings.append(Finding(
@@ -2128,7 +2235,10 @@ def print_findings(findings: list[Finding]) -> None:
 def print_summary(findings: list[Finding]) -> None:
     counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
     parts = [f"{c(sev, sev)}: {counts[sev]}" for sev in SEVERITY_ORDER if counts[sev]]
-    print(f"\nSummary — {' | '.join(parts)}")
+    if parts:
+        print(f"\nSummary — {' | '.join(parts)}")
+    else:
+        print("\nSummary — no findings")
 
 
 # ---------------------------------------------------------------------------
@@ -2136,13 +2246,18 @@ def print_summary(findings: list[Finding]) -> None:
 # ---------------------------------------------------------------------------
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="site-audit",
+        prog=APP_NAME,
         description=(
             "Authorized web site exposure auditor.\n"
             "Inspired by nuclei, gobuster, wappalyzer, and nikto.\n\n"
             "Only use against targets you own or have explicit permission to test."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"{APP_NAME} {__version__}",
     )
     parser.add_argument("url", nargs="?", default=None, help="Base URL to inspect (e.g. https://example.com) — omit to enter interactive mode")
     parser.add_argument(
@@ -2309,13 +2424,20 @@ def run_scan(args: argparse.Namespace) -> int:
     time_budget = TimeBudget(time_budget_seconds)
     max_paths = profile_defaults.get("max_paths")
     
-    # Parse custom headers
-    custom_headers = {}
-    if hasattr(args, 'headers') and args.headers:
-        for header_str in args.headers:
-            if ":" in header_str:
-                key, val = header_str.split(":", 1)
-                custom_headers[key.strip()] = val.strip()
+    try:
+        custom_headers = parse_custom_headers(getattr(args, "headers", []) or [])
+        proxy = validate_proxy_url(getattr(args, "proxy", None))
+    except ValueError as exc:
+        print(c("CRITICAL", f"[ERROR] {exc}"))
+        return 1
+
+    port_list: list[int] | None = None
+    if getattr(args, "ports", None):
+        try:
+            port_list = get_ports_for_url(base_url, args.ports)
+        except ValueError as exc:
+            print(c("CRITICAL", f"[ERROR] Invalid --ports value: {exc}"))
+            return 1
 
     basic_user = getattr(args, "basic_user", None)
     basic_pass = getattr(args, "basic_pass", None)
@@ -2331,7 +2453,7 @@ def run_scan(args: argparse.Namespace) -> int:
         timeout=timeout,
         retries=retries,
         verify_ssl=not args.insecure,
-        proxy=getattr(args, 'proxy', None),
+        proxy=proxy,
         custom_headers=custom_headers,
         auth=auth,
         bearer_token=bearer_token,
@@ -2409,6 +2531,7 @@ def run_scan(args: argparse.Namespace) -> int:
                 }
                 report_payload = {
                     "schema_version": REPORT_SCHEMA_VERSION,
+                    "tool": {"name": APP_NAME, "version": __version__},
                     "target": base_url,
                     "timestamp": finished_time.isoformat(),
                     "mode": "discover",
@@ -2460,7 +2583,7 @@ def run_scan(args: argparse.Namespace) -> int:
             )
 
         print(c("INFO", "=" * 64))
-        print(c("INFO", f"  site-audit"))
+        print(c("INFO", f"  {APP_NAME} v{__version__}"))
         print(c("INFO", f"  Target   : {base_url}"))
         print(c("INFO", f"  Platform : {', '.join(platforms) or 'unknown'}"))
         print(c("INFO", f"  Time     : {datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}"))
@@ -2479,11 +2602,10 @@ def run_scan(args: argparse.Namespace) -> int:
         all_findings: list[Finding] = []
         
         # Port scanning
-        if getattr(args, 'ports', None) and not time_budget.exhausted():
+        if port_list and not dry_run and not time_budget.exhausted():
             try:
                 parsed_url = urlparse(base_url)
                 host = parsed_url.hostname or ""
-                port_list = get_ports_for_url(base_url, args.ports)
                 print(f"Scanning {len(port_list)} ports on {host}...")
                 port_results = scan_ports(host, port_list, timeout=2.0)
                 open_ports = [p for p, is_open in port_results.items() if is_open]
@@ -2554,6 +2676,7 @@ def run_scan(args: argparse.Namespace) -> int:
         }
         report_payload = {
             "schema_version": REPORT_SCHEMA_VERSION,
+            "tool": {"name": APP_NAME, "version": __version__},
             "target": base_url,
             "timestamp": finished_time.isoformat(),
             "mode": "audit",
@@ -2811,7 +2934,7 @@ def create_prompt_session(history_enabled: bool, history_path: str):
 
 def interactive_mode(default_workers: int, history_enabled: bool = False) -> None:
     print(c("INFO", "=" * 64))
-    print(c("INFO", "  site-audit  —  interactive mode"))
+    print(c("INFO", f"  {APP_NAME} v{__version__}  —  interactive mode"))
     print(c("INFO", "  type a URL to scan, 'help' for options, 'exit' to quit"))
     print(c("INFO", "=" * 64))
 
