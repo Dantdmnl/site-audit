@@ -15,8 +15,6 @@ import requests
 import tldextract
 from urllib3.exceptions import HTTPError
 
-VERSION = "1.1.0rc1"
-SCHEMA_VERSION = "1.1"
 EXTRACT_DOMAIN = tldextract.TLDExtract(
     suffix_list_urls=(), cache_dir=None, include_psl_private_domains=True,
 )

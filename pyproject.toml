@@ -25,17 +25,17 @@ dependencies = [
 dev = ["setuptools>=83,<85", "coverage>=7.6,<8", "ruff>=0.11,<1", "build>=1.2,<2", "pip-audit>=2.8,<3"]
 
 [project.scripts]
-site-audit = "site_audit:main"
+site-audit = "site_audit.cli:main"
 
 [project.urls]
 Repository = "https://github.com/Dantdmnl/site-audit"
 Issues = "https://github.com/Dantdmnl/site-audit/issues"
 
-[tool.setuptools]
-py-modules = ["site_audit", "audit_core", "audit_rules", "audit_reports"]
+[tool.setuptools.packages.find]
+include = ["site_audit*"]
 
 [tool.setuptools.dynamic]
-version = {attr = "audit_core.VERSION"}
+version = {attr = "site_audit.version.VERSION"}
 
 [tool.ruff]
 target-version = "py310"
@@ -46,7 +46,7 @@ select = ["E9", "F", "B"]
 ignore = ["B028"]
 
 [tool.coverage.run]
-source = ["site_audit", "audit_core", "audit_rules", "audit_reports"]
+source = ["site_audit"]
 branch = true
 
 [tool.coverage.report]

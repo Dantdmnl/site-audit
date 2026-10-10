@@ -1,5 +1,13 @@
 # Release Candidate Validation
 
+## Organization Follow-Up (Unreleased)
+
+The package-layout refactor was checked locally on 2026-10-10 with Windows/Python 3.12.14. All 114 tests passed, including six new package/import-boundary regressions. Lint passed. Comparing parsed Python syntax trees confirmed that all 94 original top-level function/class bodies were preserved through relocation. Whole-package coverage remains 69%, with the same 88%/92%/98% focused transport/rule/report-validation coverage. Current paths are documented in ARCHITECTURE.md; names below describe the published candidate's original layout.
+
+The package build and expanded fresh-wheel smoke checks validate console/module/legacy console entry points and imports outside the checkout. Each push also runs the remote six-job matrix. This change does not modify the existing release/tag.
+
+## Published Candidate Record
+
 Validated locally on 2026-10-10 using Windows and Python 3.12.14. Current package: `1.1.0rc1`, Git release: `v1.1.0-rc.1`. Earlier live checks are identified separately below. These are test results, not security certifications.
 
 ## Release Candidate Checks

@@ -33,6 +33,9 @@ def main() -> None:
         run([python, "-m", "pip", "install", str(wheel)], root)
         version_output = run([cli, "--version"], root).strip()
         assert version_output == f"site-audit {version}", version_output
+        assert run([python, "-m", "site_audit", "--version"], root).strip() == version_output
+        assert run([python, "-c", "import site_audit; site_audit.main()", "--version"], root).strip() == version_output
+        run([python, "-c", "import site_audit.catalog, site_audit.cli, site_audit.core, site_audit.defaults, site_audit.discovery, site_audit.models, site_audit.network, site_audit.reporting, site_audit.report_validation"], root)
         assert "No broken requirements" in run([python, "-m", "pip", "check"], root)
         report_path = root / "report.json"
         run([cli, "https://example.invalid/", "--dry-run", "--strict", "--no-load-prefs", "--no-save-prefs", "--last-scope", "project", "--output", str(report_path)], root)

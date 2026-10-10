@@ -12,8 +12,9 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
-import site_audit as audit
-from audit_core import ScanRuntime, ScanScope, TimeBudget
+from site_audit import network
+from site_audit import cli as audit
+from site_audit.core import ScanRuntime, ScanScope, TimeBudget
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -213,7 +214,7 @@ class LocalHTTPTests(unittest.TestCase):
 
     def test_dry_run_does_not_discover_pac_or_request(self):
         args = audit.parse_args([self.base, "--dry-run", "--system-proxy", "--no-save-last", "--no-save-prefs", "--no-load-prefs"])
-        with patch.object(audit.pypac, "get_pac", side_effect=AssertionError("PAC should not run")), redirect_stdout(StringIO()):
+        with patch.object(network.pypac, "get_pac", side_effect=AssertionError("PAC should not run")), redirect_stdout(StringIO()):
             self.assertEqual(audit.run_scan(args), 0)
         self.assertEqual(Handler.records, [])
 

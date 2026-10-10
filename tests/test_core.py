@@ -11,8 +11,9 @@ import requests
 from urllib3.exceptions import HTTPError
 from urllib3.response import HTTPResponse
 
-import site_audit as audit
-from audit_core import ScanExecutor, ScanRuntime, ScanScope, TimeBudget, canonical_url, redacted_url, retry_delay
+from site_audit import reporting
+from site_audit import cli as audit
+from site_audit.core import ScanExecutor, ScanRuntime, ScanScope, TimeBudget, canonical_url, redacted_url, retry_delay
 
 
 class ScopeTests(unittest.TestCase):
@@ -233,7 +234,7 @@ class ExportTests(unittest.TestCase):
     def test_csv_formula_protection(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.csv"
-            audit.write_csv(str(path), [audit.Finding("INFO", "tech", "=HYPERLINK('evil')", "@formula")])
+            reporting.write_csv(str(path), [audit.Finding("INFO", "tech", "=HYPERLINK('evil')", "@formula")])
             value = path.read_text()
         self.assertIn("'=HYPERLINK", value)
         self.assertIn("'@formula", value)
@@ -241,7 +242,7 @@ class ExportTests(unittest.TestCase):
     def test_html_escapes_evidence_and_records_partial_coverage(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.html"
-            audit.write_html_report(str(path), mode="audit", target="https://example.com/", platforms=[], settings={}, findings=[audit.Finding("INFO", "body", "example", "<script>bad()</script>", evidence="<img onerror=bad()>")], scan={"status": "partial", "reasons": ["body_limit"]})
+            reporting.write_html_report(str(path), mode="audit", target="https://example.com/", platforms=[], settings={}, findings=[audit.Finding("INFO", "body", "example", "<script>bad()</script>", evidence="<img onerror=bad()>")], scan={"status": "partial", "reasons": ["body_limit"]})
             value = path.read_text()
         self.assertNotIn("<script>bad()", value)
         self.assertIn("&lt;img", value)
@@ -251,9 +252,9 @@ class ExportTests(unittest.TestCase):
     def test_atomic_failure_preserves_original_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "report.json"
-            audit.write_json_atomic(str(path), {"original": True})
-            with patch.object(audit._os, "replace", side_effect=OSError("denied")), self.assertRaises(OSError):
-                audit.write_json_atomic(str(path), {"original": False})
+            reporting.write_json_atomic(str(path), {"original": True})
+            with patch.object(reporting._os, "replace", side_effect=OSError("denied")), self.assertRaises(OSError):
+                reporting.write_json_atomic(str(path), {"original": False})
             self.assertIn('"original": true', path.read_text())
             self.assertEqual(list(Path(tmp).glob("*.tmp")), [])
 

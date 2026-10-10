@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-import site_audit as audit
+from site_audit import cli as audit
 
 
 def state():

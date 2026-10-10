@@ -49,7 +49,7 @@ site-audit https://example.com --dry-run --no-load-prefs --no-save-prefs --no-sa
 site-audit --export-last --format html --output previous.html
 ```
 
-`python site_audit.py` accepts the same arguments. Without a URL it opens the interactive prompt; `help` lists commands.
+`python -m site_audit` accepts the same arguments. The root `python site_audit.py` launcher remains compatible with source checkouts, including its Windows virtual-environment bootstrap. Without a URL it opens the interactive prompt; `help` lists commands.
 
 Profiles configure workers, request timeout, retries, and path selection. Explicit CLI values take precedence over saved preferences and profile defaults. `quick` targets higher-priority paths; `standard` uses all applicable built-in paths; `deep` increases concurrency with a two-minute best-effort budget. More workers do not bypass the global rate.
 
@@ -128,6 +128,8 @@ Preferences: `~/.site_audit_config.json` and `./.site_audit.json` (project overr
 
 ## Development
 
+Application modules live in `site_audit/`; regression tests in `tests/`; design/contracts in `docs/`; package verification tools in `scripts/`. The root script is only a compatibility launcher. See [project architecture](docs/ARCHITECTURE.md) for module ownership and dependency boundaries.
+
 ```sh
 python -m pip install -e '.[dev]'
 python -m unittest discover -s tests -v
@@ -142,6 +144,7 @@ python -m pip_audit --local --skip-editable
 Tests use local HTTP fixtures and mocks, never public websites. CI runs Windows/Linux on Python 3.10/3.12/3.14 with lint, tests, per-module coverage gates, package builds, clean wheel installations, and dependency auditing.
 
 - [Research and design](docs/RESEARCH.md)
+- [Project architecture](docs/ARCHITECTURE.md)
 - [Quality roadmap](docs/ROADMAP.md)
 - [Validation results](docs/VALIDATION.md)
 - [Contributing](CONTRIBUTING.md)

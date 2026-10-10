@@ -41,12 +41,14 @@ Decision: severity and confidence are separate. Preserve reproducible evidence w
 
 ## Architecture
 
-- `audit_core.py`: URL identity, scope, shared limits, transport, cancellation, accounting.
-- `audit_rules.py`: content/policy checks with evidence and remediation.
-- `audit_reports.py`: bounded JSON loading and schema/type validation before export.
-- `site_audit.py`: CLI/interactive orchestration, inventories, discovery, exports.
+- `site_audit/core.py`: URL identity, scope, shared limits, transport, cancellation, accounting.
+- `site_audit/rules.py`: content/policy checks with evidence and remediation.
+- `site_audit/report_validation.py`: bounded JSON loading and schema/type validation before export.
+- `site_audit/network.py`, `models.py`, `defaults.py`, and `catalog.py`: shared sessions/configuration and inventories.
+- `site_audit/discovery.py` and `reporting.py`: inventories and report exports independent of the CLI.
+- `site_audit/cli.py`: CLI/interactive orchestration. Root `site_audit.py`: compatibility launcher only.
 
-The CLI remains compatible while shared risk-sensitive behavior moves into focused modules. Full browser crawling and exploit engines introduce substantial maintenance obligations; established tools already cover them. Prioritize correctness in selected checks.
+The CLI remains compatible while shared risk-sensitive behavior moves into focused modules; the dependency graph is tested for cycles. [Architecture](ARCHITECTURE.md) documents ownership. Full browser crawling and exploit engines introduce substantial maintenance obligations; established tools already cover them. Prioritize correctness in selected checks.
 
 ## Release Criteria
 

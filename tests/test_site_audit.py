@@ -16,7 +16,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-import site_audit
+from site_audit import reporting
+from site_audit import cli as site_audit
 
 
 class FakeResponse:
@@ -101,10 +102,10 @@ class OutputWriterTests(unittest.TestCase):
             xml_path = tmp_path / "report.xml"
             html_path = tmp_path / "report.html"
 
-            site_audit.write_json_atomic(str(json_path), {"tool": {"version": site_audit.__version__}})
-            site_audit.write_csv(str(csv_path), [finding])
-            site_audit.write_xml(str(xml_path), [finding], "https://example.com/")
-            site_audit.write_html_report(
+            reporting.write_json_atomic(str(json_path), {"tool": {"version": site_audit.__version__}})
+            reporting.write_csv(str(csv_path), [finding])
+            reporting.write_xml(str(xml_path), [finding], "https://example.com/")
+            reporting.write_html_report(
                 str(html_path),
                 mode="audit",
                 target="https://example.com/",

@@ -5,9 +5,10 @@ from unittest.mock import patch
 
 import requests
 
-import site_audit as audit
-from audit_core import ScanRuntime, ScanScope, TimeBudget
-from audit_rules import header_checks, sensitive_match
+from site_audit import discovery
+from site_audit import cli as audit
+from site_audit.core import ScanRuntime, ScanScope, TimeBudget
+from site_audit.rules import header_checks, sensitive_match
 
 
 def response(body: str, content_type: str = "text/plain", url: str = "https://example.com/", status: int = 200):
@@ -153,23 +154,23 @@ class ConfigurationTests(unittest.TestCase):
                 audit.normalize_base_url(value)
 
     def test_url_identity_preserves_query_path_and_strips_fragment(self):
-        self.assertEqual(audit.normalize_url("/post?id=7#section", "https://example.com/"), "https://example.com/post?id=7")
-        self.assertFalse(audit.is_internal("http://example.com/", "https://example.com/"))
+        self.assertEqual(discovery.normalize_url("/post?id=7#section", "https://example.com/"), "https://example.com/post?id=7")
+        self.assertFalse(discovery.is_internal("http://example.com/", "https://example.com/"))
 
     def test_public_and_private_suffixes(self):
-        self.assertEqual(audit._base_domain("shop.example.co.uk"), "example.co.uk")
-        self.assertEqual(audit._base_domain("tenant.github.io"), "tenant.github.io")
+        self.assertEqual(discovery._base_domain("shop.example.co.uk"), "example.co.uk")
+        self.assertEqual(discovery._base_domain("tenant.github.io"), "tenant.github.io")
 
     def test_scalar_and_malformed_data_json_are_ignored(self):
         for body in ("42", "null", '"string"', '{"data":42}'):
-            with self.subTest(body=body), patch.object(audit, "fetch_response", return_value=(response(body), None)):
-                self.assertEqual(audit.fetch_api_urls(object(), "https://example.com/", audit.ScanConfig()), set())
+            with self.subTest(body=body), patch.object(discovery, "fetch_response", return_value=(response(body), None)):
+                self.assertEqual(discovery.fetch_api_urls(object(), "https://example.com/", audit.ScanConfig()), set())
 
     def test_foreign_sitemap_is_never_fetched(self):
         called = []
         def fetch(session, url, config):
             called.append(url)
             return "Sitemap: https://foreign.invalid/map.xml" if url.endswith("robots.txt") else "<sitemapindex><sitemap><loc>https://foreign.invalid/nested.xml</loc></sitemap></sitemapindex>"
-        with patch.object(audit, "fetch_text", side_effect=fetch):
-            audit.crawl_sitemaps(object(), "https://example.com/", audit.ScanConfig())
+        with patch.object(discovery, "fetch_text", side_effect=fetch):
+            discovery.crawl_sitemaps(object(), "https://example.com/", audit.ScanConfig())
         self.assertTrue(all(ScanScope("https://example.com/").allows(url) for url in called))

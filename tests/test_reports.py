@@ -8,8 +8,9 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-import site_audit as audit
-from audit_reports import load_report, validate_report
+from site_audit import reporting
+from site_audit import cli as audit
+from site_audit.report_validation import load_report, validate_report
 
 
 def report():
@@ -41,7 +42,7 @@ class ReportValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "large.json"
             path.write_bytes(b" " * 2048)
-            with patch("audit_reports.MAX_REPORT_BYTES", 1024), self.assertRaisesRegex(ValueError, "exceeds"):
+            with patch("site_audit.report_validation.MAX_REPORT_BYTES", 1024), self.assertRaisesRegex(ValueError, "exceeds"):
                 load_report(str(path))
 
     def test_corrupt_last_report_returns_error_without_falling_back(self):
@@ -58,7 +59,7 @@ class ReportValidationTests(unittest.TestCase):
         value["finished_at"] = "2026-10-10T00:00:01Z"
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             path = Path(tmp) / "report.html"
-            self.assertEqual(audit.write_report(value, str(path), "html", report_title="Test", report_brand="Test", report_logo=None), 0)
+            self.assertEqual(reporting.write_report(value, str(path), "html", report_title="Test", report_brand="Test", report_logo=None), 0)
             self.assertIn("2026-10-10T00:00:00Z", path.read_text())
 
     def test_all_export_formats_accept_one_validated_contract(self):
@@ -67,7 +68,7 @@ class ReportValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp, redirect_stdout(io.StringIO()):
             for format_name in ("json", "html", "csv", "xml"):
                 path = Path(tmp) / ("report." + format_name)
-                self.assertEqual(audit.write_report(value, str(path), format_name, report_title="Test", report_brand="Test", report_logo=None), 0)
+                self.assertEqual(reporting.write_report(value, str(path), format_name, report_title="Test", report_brand="Test", report_logo=None), 0)
                 self.assertGreater(path.stat().st_size, 0)
         self.assertEqual(value, original)
 
@@ -78,31 +79,3 @@ class ReportValidationTests(unittest.TestCase):
         value["result"]["discovered"] = ["javascript:alert(1)"]
         with self.assertRaises(ValueError):
             validate_report(value)
-
-
-class DiscoveryParsingTests(unittest.TestCase):
-    def test_sitemap_index_can_point_to_extensionless_urls(self):
-        data = '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><sitemap><loc>https://example.com/maps?id=1</loc></sitemap></sitemapindex>'
-        nested, pages = audit.extract_sitemap_entries(data)
-        self.assertEqual(nested, ["https://example.com/maps?id=1"])
-        self.assertEqual(pages, [])
-
-    def test_xml_document_url_is_not_recursed_as_a_sitemap(self):
-        data = '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9"><url><loc>https://example.com/document.xml</loc></url></urlset>'
-        self.assertEqual(audit.extract_sitemap_entries(data), ([], ["https://example.com/document.xml"]))
-
-    def test_xml_entities_are_rejected(self):
-        value = '<!DOCTYPE urlset [<!ENTITY x "private">]><urlset><url><loc>&x;</loc></url></urlset>'
-        self.assertEqual(audit.extract_sitemap_entries(value), ([], []))
-
-    def test_atom_href_and_rss_document_links_are_retained(self):
-        xml = '<feed xmlns="http://www.w3.org/2005/Atom"><entry><link rel="alternate" href="https://example.com/article.html?q=1"/><link rel="self" href="https://example.com/feed-item"/></entry></feed>'
-        with patch.object(audit, "fetch_text", return_value=xml):
-            result = audit.crawl_feeds(object(), "https://example.com/", "", audit.ScanConfig())
-        self.assertEqual(result, {"https://example.com/article.html?q=1"})
-
-    def test_document_urls_are_content_but_static_assets_are_not(self):
-        for url in ("/article.html", "/document.pdf", "/page.php?id=1"):
-            self.assertTrue(audit.is_content_url(url, "https://example.com/"))
-        for url in ("/image.png", "/assets/site.js", "https://foreign.example/article.html"):
-            self.assertFalse(audit.is_content_url(url, "https://example.com/"))

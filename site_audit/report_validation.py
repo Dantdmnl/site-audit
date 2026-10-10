@@ -5,7 +5,7 @@ import json
 import math
 from datetime import datetime
 
-from audit_core import canonical_url
+from .core import canonical_url
 
 MAX_REPORT_BYTES = 10 * 1024 * 1024
 SEVERITIES = {"CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO", "OK"}

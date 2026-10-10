@@ -12,6 +12,12 @@
 - Validated legacy/current stored reports, XML entity protection, structural sitemaps, RSS/Atom document links.
 - Interactive limits/boolean overrides, preference/privacy precedence, Windows paths, redacted history, and clean package smoke tests.
 
+## Organization Follow-Up
+
+- Application code now lives in a conventional package with separate models, defaults/catalogs, network, discovery, and reporting modules.
+- All original scan function/class bodies are preserved by the relocation; package-boundary regression tests supplement the existing suite.
+- Root script/Windows launcher and installed console compatibility are retained; module execution is supported.
+
 ## Test Strategy
 
 Unit tests cover detection positives/negatives, policy equivalence, configuration precedence, identity, and invalid data. Local HTTP fixtures cover redirects, credential containment, retries, gzip caps, slow responses, rate/request budgets, TCP observations, report contents, and exits. No public target is required.
@@ -20,11 +26,11 @@ Every high/critical rule needs a false-positive fixture. Track transport/rule co
 
 ## Remaining Work
 
-1. Run the remote OS/Python CI matrix; local Windows validation cannot prove portability.
+1. Continue requiring the remote OS/Python CI matrix for changes; the release-candidate matrix passed, but local validation alone cannot prove future portability.
 2. Expand sensitive-format fixtures, keeping unsupported formats informational until verified.
 3. Add authenticated-session validation and permission-aware file-based secret input; environment-variable input is implemented.
 4. Extend API inventory and bounded pagination; recursive HTML crawling needs depth/URL/request limits. RSS/Atom parsing is implemented.
-5. Separate legacy reporting/discovery modules after stronger integration coverage.
+5. Further separate interactive/preferences and scan-check orchestration after stronger coverage. Reporting/discovery are now separate modules.
 6. Add findings baseline comparison and future-schema migrations with explicit compatibility rules. Schema 1.0/1.1 validation is implemented.
 7. Consider worker-process isolation if hard wall-clock termination becomes a requirement.
 8. Verify HTML layout across viewports and align metadata contracts before adding export formats.

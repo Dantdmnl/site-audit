@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Organize the application into a `site_audit` package with focused transport/network, models, defaults, catalog, discovery, reporting, validation, and CLI modules.
+- Keep `python site_audit.py`, the Windows launcher, and legacy installed console entry points compatible; add `python -m site_audit`.
+- Move distribution versions to a dependency-free metadata module and update package discovery, manifests, coverage gates, and architecture documentation.
+- Add regression checks for launchers, module dry runs, shared models, lightweight imports, and acyclic module dependencies; expand clean wheel smoke checks.
+
+This refactor changes internal Python import paths, not scanner logic, CLI flags, report schemas, or exit semantics. No new release/tag is created by this organization-only push.
+
 ## 1.1.0rc1 / v1.1.0-rc.1 - 2026-10-10
 
 Release candidate, not a stable security certification. Consolidates the unreleased 1.1 development work below.
