@@ -22,6 +22,7 @@ Release candidate, not a stable security certification. Consolidates the unrelea
 - Context-sensitive HTTP policy checks and unsupported critical CORS/method conclusions.
 - CLI/session/preference precedence, including explicitly selected profile-default values and privacy flags.
 - Query identity, IPv6/IDNA URL handling, received-cookie containment, report metadata, CSV formulas, and monotonic durations.
+- Vulnerable legacy setuptools seeded by Python 3.10 environments; build/development requirements now select the patched >=83 toolchain.
 
 ### Migration
 

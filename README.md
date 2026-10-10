@@ -14,6 +14,7 @@ Install from a source checkout on Windows:
 
 ```powershell
 python -m venv .venv
+.venv\Scripts\python -m pip install --upgrade pip 'setuptools>=83,<85'
 .venv\Scripts\python -m pip install .
 .venv\Scripts\site-audit --help
 ```
@@ -22,6 +23,7 @@ Linux:
 
 ```sh
 python -m venv .venv
+.venv/bin/python -m pip install --upgrade pip 'setuptools>=83,<85'
 .venv/bin/python -m pip install .
 .venv/bin/site-audit --help
 ```

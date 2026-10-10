@@ -29,7 +29,7 @@ def main() -> None:
         commands = root / "venv" / ("Scripts" if os.name == "nt" else "bin")
         python = str(commands / ("python.exe" if os.name == "nt" else "python"))
         cli = str(commands / ("site-audit.exe" if os.name == "nt" else "site-audit"))
-        run([python, "-m", "pip", "install", "--upgrade", "pip"], root)
+        run([python, "-m", "pip", "install", "--upgrade", "pip", "setuptools>=83,<85"], root)
         run([python, "-m", "pip", "install", str(wheel)], root)
         version_output = run([cli, "--version"], root).strip()
         assert version_output == f"site-audit {version}", version_output

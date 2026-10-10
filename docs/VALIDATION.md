@@ -13,6 +13,8 @@ Validated locally on 2026-10-10 using Windows and Python 3.12.14. Current packag
 - Fresh virtual environment outside the checkout installed the wheel with independently resolved dependencies; actual console version, zero-request dry run, project-scoped stored report, HTML export, and `pip check` passed.
 - Windows PowerShell launcher passed setup/version verification with the existing virtual environment, revalidating dependencies after the requirements change.
 
+The first remote matrix exposed vulnerable setuptools versions seeded by Python 3.10 environments. Tests and clean installs passed; the advisory gate correctly failed. Build/development environments and clean-package smoke tests now require setuptools >=83,<85, following the [upstream fix](https://setuptools.pypa.io/en/latest/history.html#v83-0-0). A fresh matrix is required for publication, not a waived advisory.
+
 The release gate also requires the six Windows/Linux Python 3.10/3.12/3.14 jobs to pass on the exact release commit. The published GitHub release and attached validation record include the actual CI outcome/link. macOS is not in the tested matrix. CI package smoke checks resolve dependencies afresh on each platform.
 
 The sandbox prevented loopback networking and normal temporary-directory access. Integration tests, package installation/building, and dependency auditing were run with the required access instead of accepting sandbox-caused failures as results.
