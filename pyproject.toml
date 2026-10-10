@@ -1,0 +1,53 @@
+[build-system]
+requires = ["setuptools>=77,<83"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "site-audit"
+dynamic = ["version"]
+description = "Scoped HTTP exposure checks and public URL discovery with evidence and coverage reports"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"
+authors = [{name = "site-audit contributors"}]
+dependencies = [
+  "requests>=2.32.4,<3",
+  "urllib3>=2.8,<3",
+  "beautifulsoup4>=4.12.3,<5",
+  "soupsieve>=2.9,<3",
+  "defusedxml>=0.7.1,<1",
+  "prompt_toolkit>=3.0.48,<4",
+  "pypac>=0.17,<1",
+  "tldextract>=5.3,<6",
+]
+
+[project.optional-dependencies]
+dev = ["coverage>=7.6,<8", "ruff>=0.11,<1", "build>=1.2,<2", "pip-audit>=2.8,<3"]
+
+[project.scripts]
+site-audit = "site_audit:main"
+
+[project.urls]
+Repository = "https://github.com/Dantdmnl/site-audit"
+Issues = "https://github.com/Dantdmnl/site-audit/issues"
+
+[tool.setuptools]
+py-modules = ["site_audit", "audit_core", "audit_rules", "audit_reports"]
+
+[tool.setuptools.dynamic]
+version = {attr = "audit_core.VERSION"}
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "F", "B"]
+ignore = ["B028"]
+
+[tool.coverage.run]
+source = ["site_audit", "audit_core", "audit_rules", "audit_reports"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true

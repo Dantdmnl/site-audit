@@ -1,0 +1,6 @@
+include LICENSE README.md CHANGELOG.md CONTRIBUTING.md SECURITY.md requirements.txt run.ps1
+recursive-include docs *.md
+recursive-include tests *.py
+recursive-include scripts *.py
+prune .venv
+prune dist

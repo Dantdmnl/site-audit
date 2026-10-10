@@ -47,6 +47,13 @@ MANIFEST
 # Logs
 *.log
 
+# Local scan state and test tooling
+.site_audit.json
+.site_audit_last.json
+.coverage*
+htmlcov/
+.ruff_cache/
+
 # Windows
 Thumbs.db
 Desktop.ini

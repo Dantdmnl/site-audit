@@ -11,7 +11,7 @@ import sys as _sys
 
 _here = _os.path.dirname(_os.path.abspath(__file__))
 _venv_python = _os.path.join(_here, ".venv", "Scripts", "python.exe")
-if _os.path.isfile(_venv_python) and _os.path.abspath(_sys.executable) != _os.path.abspath(_venv_python):
+if __name__ == "__main__" and _os.path.isfile(_venv_python) and _os.path.normcase(_os.path.abspath(_sys.executable)) != _os.path.normcase(_os.path.abspath(_venv_python)) and _sys.prefix == _sys.base_prefix:
     _os.execv(_venv_python, [_venv_python] + _sys.argv)
 # ---------------------------------------------------------------------------
 
@@ -31,11 +31,21 @@ import threading
 import time
 import uuid
 import xml.etree.ElementTree as ET
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, wait
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import TypedDict
 from urllib.parse import urljoin, urlparse
+from http.cookies import SimpleCookie
+
+from audit_core import (
+    EXTRACT_DOMAIN, SCHEMA_VERSION, VERSION, ScanExecutor, ScanRuntime, ScanScope, TimeBudget,
+    bounded_fetch, canonical_url, finding_id, redacted_url,
+)
+from audit_rules import HEADER_REFERENCE, challenge_page, header_checks, sensitive_match
+from audit_reports import load_report, parse_timestamp, validate_report
+from defusedxml.ElementTree import fromstring as parse_xml
+from defusedxml.common import DefusedXmlException
 
 import requests
 import pypac
@@ -44,13 +54,12 @@ from bs4 import BeautifulSoup
 from requests.adapters import HTTPAdapter
 from requests.cookies import RequestsCookieJar
 from urllib3.exceptions import InsecureRequestWarning
-from urllib3.util.retry import Retry
 
 try:
     from prompt_toolkit import PromptSession as PT_PromptSession
     from prompt_toolkit.completion import Completer as PT_Completer, Completion as PT_Completion
     from prompt_toolkit.document import Document as PT_Document
-    from prompt_toolkit.history import FileHistory as PT_FileHistory, InMemoryHistory as PT_InMemoryHistory, DummyHistory as PT_DummyHistory
+    from prompt_toolkit.history import FileHistory as PT_FileHistory, DummyHistory as PT_DummyHistory
     HAS_PROMPT_TOOLKIT = True
 except ImportError:
     HAS_PROMPT_TOOLKIT = False
@@ -60,8 +69,8 @@ MAX_WORKERS = 20
 RETRIES = 2
 VERIFY_SSL = True
 APP_NAME = "site-audit"
-__version__ = "1.0.0"
-REPORT_SCHEMA_VERSION = "1.0"
+__version__ = VERSION
+REPORT_SCHEMA_VERSION = SCHEMA_VERSION
 PREFS_VERSION = 1
 USER_PREFS_FILENAME = ".site_audit_config.json"
 PROJECT_PREFS_FILENAME = ".site_audit.json"
@@ -123,6 +132,8 @@ PREF_KEYS = [
     "ports",
     "proxy",
     "discover_subdomains",
+    "rate_limit", "max_requests", "max_body_bytes", "system_proxy",
+    "strict",
 ]
 
 PREF_DEFAULTS = {
@@ -145,6 +156,11 @@ PREF_DEFAULTS = {
     "ports": None,
     "proxy": None,
     "discover_subdomains": False,
+    "rate_limit": 10.0,
+    "max_requests": 1000,
+    "max_body_bytes": 1_048_576,
+    "system_proxy": False,
+    "strict": False,
 }
 TEXTUAL_CONTENT_TYPES = (
     "text/",
@@ -155,9 +171,7 @@ TEXTUAL_CONTENT_TYPES = (
 )
 HEADERS = {
     "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/134.0.0.0 Safari/537.36"
+        f"site-audit/{VERSION}"
     ),
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
@@ -200,6 +214,7 @@ INTERACTIVE_COMMANDS = [
     "history",
     "clear",
     "help",
+    "version",
     "exit",
     "quit",
 ]
@@ -221,16 +236,10 @@ INTERACTIVE_SET_KEYS = [
     "report-title",
     "report-brand",
     "report-logo",
+    "rate-limit", "max-requests", "max-body-bytes", "ports", "proxy", "system-proxy", "strict", "discover-subdomains",
 ]
 
-INTERACTIVE_UNSET_KEYS = [
-    "output",
-    "fail-on",
-    "log-file",
-    "report-title",
-    "report-brand",
-    "report-logo",
-]
+INTERACTIVE_UNSET_KEYS = list(INTERACTIVE_SET_KEYS)
 
 INTERACTIVE_FLAGS = [
     "--mode",
@@ -260,6 +269,8 @@ INTERACTIVE_FLAGS = [
     "--bearer-token",
     "--cookie",
     "--discover-subdomains",
+    "--rate-limit", "--max-requests", "--max-body-bytes", "--ports", "--proxy", "--header", "--system-proxy", "--strict",
+    "--no-insecure", "--no-verbose", "--no-system-proxy", "--no-strict", "--no-discover-subdomains", "--bearer-token-env", "--basic-pass-env", "--dry-run",
 ]
 
 
@@ -505,6 +516,18 @@ class Finding:
     url: str = ""
     status_code: int | None = None
     extra: dict = field(default_factory=dict)
+    rule_id: str = ""
+    confidence: str = "tentative"
+    evidence: str = ""
+    remediation: str = ""
+    references: list[str] = field(default_factory=list)
+    id: str = ""
+
+    def __post_init__(self) -> None:
+        if not self.rule_id:
+            self.rule_id = self.category + "." + re.sub(r"[^a-z0-9]+", "-", self.title.lower()).strip("-")
+        if not self.id:
+            self.id = finding_id(self.rule_id, self.url)
 
 
 @dataclass
@@ -517,6 +540,13 @@ class ScanConfig:
     auth: tuple[str, str] | None = None
     bearer_token: str | None = None
     cookies: RequestsCookieJar | None = None
+    scope: ScanScope | None = None
+    runtime: ScanRuntime | None = None
+    max_body_bytes: int = 1_048_576
+    max_redirects: int = 5
+    system_proxy: bool = False
+    allow_initial_upgrade: bool = False
+    allow_initial_canonical_redirect: bool = False
 
 
 @dataclass
@@ -558,7 +588,7 @@ def build_session(config: ScanConfig) -> requests.Session:
             "http": config.proxy,
             "https": config.proxy,
         }
-    else:
+    elif config.system_proxy:
         # Use Windows PAC file if available, otherwise fallback to standard session
         try:
             pac = pypac.get_pac()
@@ -568,6 +598,9 @@ def build_session(config: ScanConfig) -> requests.Session:
                 session = requests.Session()
         except Exception:
             session = requests.Session()
+    else:
+        session = requests.Session()
+    session.trust_env = config.system_proxy and not config.proxy
     
     session.headers.update(HEADERS)
     session.headers.update(config.custom_headers)
@@ -578,16 +611,8 @@ def build_session(config: ScanConfig) -> requests.Session:
     if config.cookies:
         session.cookies.update(config.cookies)
 
-    retry = Retry(
-        total=max(0, config.retries),
-        connect=max(0, config.retries),
-        read=max(0, config.retries),
-        backoff_factor=0.4,
-        status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset({"GET", "HEAD", "OPTIONS"}),
-        raise_on_status=False,
-    )
-    adapter = HTTPAdapter(max_retries=retry, pool_connections=50, pool_maxsize=50)
+    # Retries belong to the shared transport so they consume rate/request limits.
+    adapter = HTTPAdapter(max_retries=0, pool_connections=1, pool_maxsize=1)
     session.mount("http://", adapter)
     session.mount("https://", adapter)
     session.verify = config.verify_ssl
@@ -628,21 +653,26 @@ class ThreadLocalSessionPool:
 # ---------------------------------------------------------------------------
 # Port scanning
 # ---------------------------------------------------------------------------
-def scan_ports(host: str, ports: list[int], timeout: float = 2.0) -> dict[int, bool]:
+def scan_ports(host: str, ports: list[int], timeout: float = 2.0, runtime: ScanRuntime | None = None) -> dict[int, bool | None]:
     """
     Scan a list of ports on a host.
     Returns dict mapping port -> is_open (True/False).
     """
     results = {}
     for port in ports:
+        if runtime and (runtime.budget.exhausted() or runtime.stop.is_set()):
+            runtime.mark_partial("time_budget")
+            break
         try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(timeout)
-            result = sock.connect_ex((host, port))
-            sock.close()
-            results[port] = (result == 0)
-        except (socket.timeout, socket.error):
+            remaining = runtime.budget.remaining() if runtime else None
+            with socket.create_connection((host, port), timeout=min(timeout, remaining) if remaining is not None else timeout):
+                results[port] = True
+        except ConnectionRefusedError:
             results[port] = False
+        except (socket.timeout, socket.error):
+            results[port] = None
+            if runtime:
+                runtime.mark_partial("port_errors")
     return results
 
 
@@ -651,12 +681,6 @@ def get_ports_for_url(base_url: str, scan_type: str = "http") -> list[int]:
     Get ports to scan based on URL scheme and scan_type.
     scan_type: 'http' (80,8080,etc), 'https' (443,8443,etc), 'services' (all common), or comma-separated ports.
     """
-    try:
-        parsed = urlparse(base_url)
-        scheme = parsed.scheme.lower()
-    except:
-        scheme = "https"
-    
     if scan_type == "http":
         return COMMON_PORTS["http"]
     elif scan_type == "https":
@@ -696,23 +720,8 @@ def fetch_response(
     config: ScanConfig | None = None,
 ) -> tuple[requests.Response | None, str | None]:
     """Return (response, error_message). On success error_message is None."""
-    cfg = config or ScanConfig()
-    try:
-        response = session.request(
-            method=method,
-            url=url,
-            timeout=cfg.timeout,
-            allow_redirects=allow_redirects,
-        )
-        return response, None
-    except requests.exceptions.SSLError as exc:
-        return None, f"SSL error: {exc}"
-    except requests.exceptions.ConnectionError as exc:
-        return None, f"Connection error: {exc}"
-    except requests.exceptions.Timeout:
-        return None, f"Timed out after {cfg.timeout}s"
-    except requests.RequestException as exc:
-        return None, str(exc)
+    cfg = config or ScanConfig(scope=ScanScope(url))
+    return bounded_fetch(session, url, cfg, method=method, allow_redirects=allow_redirects)
 
 
 def fetch_text(session: requests.Session, url: str, config: ScanConfig) -> str | None:
@@ -721,29 +730,28 @@ def fetch_text(session: requests.Session, url: str, config: ScanConfig) -> str |
 
 
 def normalize_url(url: str, base_url: str) -> str:
-    parsed = urlparse(urljoin(base_url, url))
-    path = parsed.path or "/"
-    if path != "/" and not path.endswith("/"):
-        path += "/"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return canonical_url(url, base_url)
 
 
 def is_internal(url: str, base_url: str) -> bool:
-    return urlparse(urljoin(base_url, url)).netloc == urlparse(base_url).netloc
+    try:
+        return ScanScope(base_url).allows(canonical_url(url, base_url))
+    except (ValueError, UnicodeError):
+        return False
 
 
 def is_content_url(url: str, base_url: str) -> bool:
     if not is_internal(url, base_url):
         return False
-    path = urlparse(url).path.lower()
+    path = urlparse(normalize_url(url, base_url)).path.lower()
     if not path or path == "/":
         return False
     blocked = ("/wp-content/", "/wp-includes/", "/wp-json/", "/static/",
                "/assets/", "/media/", "/_next/", "/_nuxt/")
     if any(path.startswith(b) for b in blocked):
         return False
-    seg = path.rsplit("/", 2)[-2] if path.endswith("/") else path.rsplit("/", 1)[-1]
-    return "." not in seg
+    asset_extensions = (".css", ".js", ".map", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico", ".woff", ".woff2", ".ttf", ".mp4", ".mp3", ".zip", ".gz")
+    return not path.endswith(asset_extensions)
 
 
 def should_inspect_body(resp: requests.Response) -> bool:
@@ -821,11 +829,6 @@ def build_soft_404_profiles(
     time_budget: TimeBudget | None = None,
 ) -> list[BodyFingerprint]:
     profiles: list[BodyFingerprint] = []
-    if homepage is not None and homepage.ok:
-        fp = body_fingerprint(homepage)
-        if fp:
-            profiles.append(fp)
-
     if time_budget:
         remaining = time_budget.remaining()
         if remaining is not None and remaining < 3:
@@ -862,22 +865,6 @@ def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
             seen.add(key)
             unique.append(finding)
     return unique
-
-
-class TimeBudget:
-    def __init__(self, seconds: int | None):
-        self.seconds = seconds
-        self._deadline = (time.monotonic() + seconds) if seconds else None
-
-    def exhausted(self) -> bool:
-        if self._deadline is None:
-            return False
-        return time.monotonic() >= self._deadline
-
-    def remaining(self) -> float | None:
-        if self._deadline is None:
-            return None
-        return max(0.0, self._deadline - time.monotonic())
 
 
 def filter_paths_for_profile(
@@ -980,26 +967,27 @@ def write_json_atomic(output_path: str, payload: dict) -> None:
 def write_csv(output_path: str, findings: list[Finding]) -> None:
     """Write findings to CSV file."""
     buffer = io.StringIO(newline="")
-    fieldnames = ["severity", "category", "title", "detail", "url", "status_code"]
+    fieldnames = ["id", "rule_id", "severity", "confidence", "category", "title", "detail", "url", "status_code", "evidence", "remediation"]
     writer = csv.DictWriter(buffer, fieldnames=fieldnames)
     writer.writeheader()
     for finding in findings:
-        writer.writerow({
-            "severity": finding.severity,
-            "category": finding.category,
-            "title": finding.title,
-            "detail": finding.detail,
-            "url": finding.url,
-            "status_code": finding.status_code or "",
-        })
+        row = {key: getattr(finding, key) for key in fieldnames}
+        # Prevent spreadsheet formula execution when opening target-controlled data.
+        writer.writerow({key: "'" + value if isinstance(value, str) and value.lstrip().startswith(("=", "+", "-", "@")) else value for key, value in row.items()})
     write_text_atomic(output_path, buffer.getvalue(), newline="")
 
 
-def write_xml(output_path: str, findings: list[Finding], target: str) -> None:
+def write_xml(output_path: str, findings: list[Finding], target: str, scan: dict | None = None, ports: dict | None = None) -> None:
     """Write findings to XML file."""
     root = ET.Element("audit")
     root.set("target", target)
     root.set("timestamp", datetime.now(timezone.utc).isoformat())
+    root.set("schema_version", REPORT_SCHEMA_VERSION)
+    root.set("tool_version", __version__)
+    if scan:
+        ET.SubElement(root, "scan").text = json.dumps(scan, sort_keys=True)
+    if ports:
+        ET.SubElement(root, "ports").text = json.dumps(ports, sort_keys=True)
     
     for finding in findings:
         item = ET.SubElement(root, "finding")
@@ -1007,6 +995,8 @@ def write_xml(output_path: str, findings: list[Finding], target: str) -> None:
         ET.SubElement(item, "category").text = finding.category
         ET.SubElement(item, "title").text = finding.title
         ET.SubElement(item, "detail").text = finding.detail
+        for key in ("id", "rule_id", "confidence", "evidence", "remediation"):
+            ET.SubElement(item, key).text = getattr(finding, key)
         ET.SubElement(item, "url").text = finding.url
         if finding.status_code:
             ET.SubElement(item, "status_code").text = str(finding.status_code)
@@ -1036,10 +1026,14 @@ def validate_proxy_url(proxy: str | None) -> str | None:
     if not proxy:
         return None
     parsed = urlparse(proxy)
-    if parsed.scheme not in ("http", "https", "socks4", "socks5"):
-        raise ValueError("proxy must use http, https, socks4, or socks5")
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("proxy must use http or https")
     if not parsed.hostname:
         raise ValueError("proxy URL must include a hostname")
+    if parsed.port == 0:
+        raise ValueError("proxy port must be 1..65535")
+    if any(ord(ch) < 32 for ch in proxy):
+        raise ValueError("proxy URL contains control characters")
     return proxy
 
 
@@ -1075,7 +1069,7 @@ def _load_prefs_file(path: str) -> dict:
     if not _os.path.isfile(path):
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as fh:
+        with open(path, "r", encoding="utf-8-sig") as fh:
             data = json.load(fh)
     except (OSError, json.JSONDecodeError, ValueError):
         return {}
@@ -1087,7 +1081,9 @@ def _load_prefs_file(path: str) -> dict:
 def _merge_prefs(base: dict, override: dict) -> dict:
     merged = dict(base)
     defaults = dict(base.get("defaults", {}))
-    defaults.update(override.get("defaults", {}) or {})
+    incoming = override.get("defaults", {})
+    if isinstance(incoming, dict):
+        defaults.update(incoming)
     merged["defaults"] = defaults
     if "version" in override:
         merged["version"] = override["version"]
@@ -1101,41 +1097,58 @@ def load_preferences() -> dict:
     return prefs
 
 
-def _normalize_pref_defaults(values: dict) -> dict:
+def _normalize_pref_defaults(values: dict, provided: set[str] | None = None) -> dict:
     normalized: dict = {}
     for key in PREF_KEYS:
-        if key not in values:
+        if key not in values or key == "proxy":
             continue
         value = values[key]
-        if value == PREF_DEFAULTS.get(key):
+        if value == PREF_DEFAULTS.get(key) and key not in (provided or set()):
             continue
         normalized[key] = value
     return normalized
 
 
 def apply_preferences_to_args(args: argparse.Namespace, prefs: dict) -> None:
+    configured = set(getattr(args, "_provided", set()))
+    args._configured = configured
     defaults = prefs.get("defaults", {}) or {}
+    if not isinstance(defaults, dict):
+        return
     for key in PREF_KEYS:
         if key not in defaults:
             continue
         if not hasattr(args, key):
             continue
-        current = getattr(args, key)
-        if current == PREF_DEFAULTS.get(key):
-            setattr(args, key, defaults[key])
+        if key not in configured:
+            value = defaults[key]
+            expected = PREF_DEFAULTS.get(key)
+            if expected is not None and type(value) is not type(expected):
+                continue
+            if key in {"output", "log_file", "report_logo", "ports", "proxy"} and value is not None and not isinstance(value, str):
+                continue
+            if key in {"workers", "timeout", "retries", "time_budget", "max_requests", "max_body_bytes"} and value is not None and (type(value) is not int or value < (0 if key == "retries" else 1)):
+                continue
+            if key in {"mode", "profile", "format", "min_severity", "fail_on"} and value is not None:
+                choices = {"mode": ("audit", "discover"), "profile": PROFILE_DEFAULTS, "format": ("json", "csv", "xml", "html"), "min_severity": SEVERITY_ORDER, "fail_on": SEVERITY_ORDER}
+                if value not in choices[key]:
+                    continue
+            setattr(args, key, value)
+            configured.add(key)
+    args._configured = configured
 
 
 def apply_preferences_to_state(state: InteractiveState, prefs: dict) -> None:
-    defaults = prefs.get("defaults", {}) or {}
-    for key in PREF_KEYS:
-        if key in state and key in defaults:
-            if state[key] == PREF_DEFAULTS.get(key):
-                state[key] = defaults[key]
+    args = argparse.Namespace(**state)
+    apply_preferences_to_args(args, prefs)
+    for key in state:
+        state[key] = getattr(args, key)
+    state["_provided"] = args._configured
 
 
 def update_preferences_from_state(prefs: dict, state: InteractiveState) -> dict:
     defaults = {key: state.get(key) for key in PREF_KEYS if key in state}
-    prefs["defaults"] = _normalize_pref_defaults(defaults)
+    prefs["defaults"] = _normalize_pref_defaults(defaults, state.get("_provided", set()))
     prefs["version"] = PREFS_VERSION
     return prefs
 
@@ -1143,9 +1156,9 @@ def update_preferences_from_state(prefs: dict, state: InteractiveState) -> dict:
 def update_preferences_from_args(prefs: dict, args: argparse.Namespace) -> dict:
     defaults = {}
     for key in PREF_KEYS:
-        if hasattr(args, key):
+        if key != "proxy" and hasattr(args, key):
             defaults[key] = getattr(args, key)
-    prefs["defaults"] = _normalize_pref_defaults(defaults)
+    prefs["defaults"] = _normalize_pref_defaults(defaults, getattr(args, "_configured", getattr(args, "_provided", set())))
     prefs["version"] = PREFS_VERSION
     return prefs
 
@@ -1171,9 +1184,8 @@ def _load_last_report(scope: str) -> dict | None:
         candidates = [_last_project_path(), _last_user_path()]
 
     for path in candidates:
-        report = _load_prefs_file(path)
-        if report:
-            return report
+        if _os.path.isfile(path):
+            return load_report(path)
     return None
 
 
@@ -1181,7 +1193,9 @@ def _findings_from_report(report: dict) -> list[Finding]:
     findings: list[Finding] = []
     for item in report.get("findings", []) or []:
         if isinstance(item, dict):
-            findings.append(Finding(**item))
+            allowed = Finding.__dataclass_fields__
+            if all(isinstance(item.get(key), str) for key in ("severity", "category", "title", "detail")):
+                findings.append(Finding(**{key: value for key, value in item.items() if key in allowed}))
     return findings
 
 
@@ -1201,11 +1215,22 @@ def export_last_report(
     report_brand: str,
     report_logo: str | None,
 ) -> int:
-    report = _load_last_report(scope)
+    try:
+        report = _load_last_report(scope)
+    except (OSError, ValueError, TypeError, UnicodeError):
+        print("[ERROR] Stored report is invalid or unreadable; run a new scan to replace it")
+        return 1
     if not report:
         print("[ERROR] No previous report found to export")
         return 1
+    return write_report(report, output_path, output_format, report_title=report_title, report_brand=report_brand, report_logo=report_logo)
 
+
+def write_report(
+    report: dict, output_path: str, output_format: str, *,
+    report_title: str, report_brand: str, report_logo: str | None,
+) -> int:
+    validate_report(report)
     mode = report.get("mode", "audit")
     target = report.get("target", "-")
     settings = report.get("settings", {})
@@ -1216,9 +1241,9 @@ def export_last_report(
     finished_at = None
     duration_seconds = report.get("duration_seconds")
     if report.get("started_at"):
-        started_at = datetime.fromisoformat(report["started_at"])
+        started_at = parse_timestamp(report["started_at"])
     if report.get("finished_at"):
-        finished_at = datetime.fromisoformat(report["finished_at"])
+        finished_at = parse_timestamp(report["finished_at"])
 
     if mode == "discover" and output_format not in ("json", "html"):
         print("[ERROR] Discover reports can only export to json or html")
@@ -1233,7 +1258,7 @@ def export_last_report(
         print(f"CSV report written to {output_path}")
         return 0
     if output_format == "xml":
-        write_xml(output_path, findings, target)
+        write_xml(output_path, findings, target, report.get("scan"), report.get("ports"))
         print(f"XML report written to {output_path}")
         return 0
     if output_format == "html":
@@ -1251,6 +1276,7 @@ def export_last_report(
             report_title=report_title,
             report_brand=report_brand,
             report_logo=report_logo,
+            scan=report.get("scan"), ports=report.get("ports"),
         )
         print(f"HTML report written to {output_path}")
         return 0
@@ -1294,6 +1320,8 @@ def write_html_report(
     report_title: str = "Security Exposure Report",
     report_brand: str = "site-audit",
     report_logo: str | None = None,
+    scan: dict | None = None,
+    ports: dict | None = None,
 ) -> None:
     findings = findings or []
     counts = {sev: 0 for sev in SEVERITY_ORDER}
@@ -1319,7 +1347,6 @@ def write_html_report(
     lines.append("  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">")
     lines.append(f"  <title>site-audit report - {_html_escape(target)}</title>")
     lines.append("  <style>")
-    lines.append("    @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&family=Source+Serif+4:wght@400;600&display=swap');")
     lines.append("    :root { --ink: #1b1d22; --muted: #5c6670; --bg: #f4f2ee; --card: #ffffff; --line: #e3e0da;")
     lines.append("      --critical: #8f1d14; --high: #b23b00; --medium: #b36f00; --low: #2a6f8f; --info: #4b5563; --ok: #1f7a3c; }")
     lines.append("    * { box-sizing: border-box; }")
@@ -1409,6 +1436,16 @@ def write_html_report(
     lines.append("      </div>")
     lines.append("    </section>")
 
+    if scan:
+        lines.append("    <section class=\"block\"><h2>Scan coverage</h2>")
+        lines.append(f"      <p>Status: {_html_escape(scan.get('status'))}. Reasons: {_html_escape(', '.join(scan.get('reasons', [])) or 'none')}.</p>")
+        lines.append(f"      <p>Requests: {_html_escape(scan.get('requests_sent', 0))}; network errors: {_html_escape(scan.get('network_errors', 0))}; endpoint probes: {_html_escape(scan.get('endpoints_completed', 0))} / {_html_escape(scan.get('endpoints_planned', 0))}.</p></section>")
+    if ports:
+        lines.append("    <section class=\"block\"><h2>TCP ports</h2><ul>")
+        for port, state in sorted(ports.items(), key=lambda item: int(item[0])):
+            lines.append(f"      <li>{_html_escape(port)}: {'open' if state is True else 'closed' if state is False else 'unknown'}</li>")
+        lines.append("    </ul></section>")
+
     if mode == "discover" and discover_result is not None:
         lines.append("    <section class=\"block\">")
         lines.append("      <h2>Discovery results</h2>")
@@ -1468,6 +1505,7 @@ def write_html_report(
                 url_text = _html_escape(f.url) if f.url else ""
                 status_text = _html_escape(f.status_code) if f.status_code is not None else ""
                 detail_text = f.detail
+                detail_text += f" | Confidence: {f.confidence} | Evidence: {f.evidence} | Remediation: {f.remediation}"
                 body_issues = f.extra.get("body_issues", []) if f.extra else []
                 if body_issues:
                     detail_text = f"{detail_text} | body: {', '.join(body_issues)}"
@@ -1510,9 +1548,26 @@ class InteractiveState(TypedDict):
     report_title: str
     report_brand: str
     report_logo: str | None
+    rate_limit: float
+    max_requests: int
+    max_body_bytes: int
+    ports: str | None
+    proxy: str | None
+    system_proxy: bool
+    discover_subdomains: bool
+    strict: bool
+    _provided: set[str]
 
 
 if HAS_PROMPT_TOOLKIT:
+    class RedactedFileHistory(PT_FileHistory):
+        def load_history_strings(self):
+            for string in super().load_history_strings():
+                yield redact_history_line(string)
+
+        def append_string(self, string: str) -> None:
+            super().append_string(redact_history_line(string))
+
     class SiteAuditCompleter(PT_Completer):
         def get_completions(self, document: PT_Document, complete_event):
             text = document.text_before_cursor
@@ -1520,7 +1575,7 @@ if HAS_PROMPT_TOOLKIT:
             current_lower = current.lower()
 
             try:
-                tokens = shlex.split(text)
+                tokens = split_interactive_line(text)
             except ValueError:
                 tokens = text.strip().split()
 
@@ -1566,7 +1621,7 @@ if HAS_PROMPT_TOOLKIT:
                         for sev in SEVERITY_ORDER:
                             if sev.lower().startswith(current_lower):
                                 yield PT_Completion(sev, start_position=-len(current))
-                    elif key in ("insecure", "verbose"):
+                    elif key in ("insecure", "verbose", "strict", "system-proxy", "discover-subdomains"):
                         for val in ("true", "false"):
                             if val.startswith(current_lower):
                                 yield PT_Completion(val, start_position=-len(current))
@@ -1648,16 +1703,11 @@ def fingerprint(
 # Security header audit
 # ---------------------------------------------------------------------------
 def audit_security_headers(response: requests.Response) -> list[Finding]:
-    findings: list[Finding] = []
-    for header, severity, message in SECURITY_HEADERS:
-        if header not in response.headers:
-            findings.append(Finding(
-                severity=severity, category="header",
-                title=f"Missing {header}",
-                detail=message,
-                url=str(response.url),
-            ))
-    return findings
+    return [Finding(
+        category="header", url=str(response.url), status_code=response.status_code,
+        confidence="certain", detail=item["evidence"], references=[HEADER_REFERENCE],
+        **item,
+    ) for item in header_checks(response)]
 
 
 # ---------------------------------------------------------------------------
@@ -1682,23 +1732,30 @@ def audit_cookies(response: requests.Response) -> list[Finding]:
     for raw in raw_cookie_headers:
         name_match = re.match(r"\s*([^=;]+)=", raw)
         name = name_match.group(1).strip() if name_match else "unknown"
-        lower = raw.lower()
+        cookie = SimpleCookie()
+        try:
+            cookie.load(raw)
+        except Exception:
+            continue
+        morsel = cookie.get(name)
+        if morsel is None:
+            continue
 
-        if "secure" not in lower:
+        if not morsel["secure"]:
             findings.append(Finding(
                 severity="MEDIUM", category="cookie",
                 title=f"Cookie '{name}' missing Secure flag",
                 detail="Cookie can be sent over HTTP",
                 url=str(response.url),
             ))
-        if "httponly" not in lower:
+        if not morsel["httponly"]:
             findings.append(Finding(
                 severity="MEDIUM", category="cookie",
                 title=f"Cookie '{name}' missing HttpOnly flag",
                 detail="Cookie accessible via JavaScript",
                 url=str(response.url),
             ))
-        if "samesite" not in lower:
+        if morsel["samesite"].lower() not in ("lax", "strict", "none"):
             findings.append(Finding(
                 severity="LOW", category="cookie",
                 title=f"Cookie '{name}' missing SameSite attribute",
@@ -1723,21 +1780,22 @@ def audit_cors(base_url: str, config: ScanConfig) -> list[Finding]:
     acao = resp.headers.get("Access-Control-Allow-Origin", "")
     acac = resp.headers.get("Access-Control-Allow-Credentials", "")
 
-    if acao == "*":
-        findings.append(Finding(
-            severity="MEDIUM", category="cors",
-            title="CORS: wildcard origin allowed",
-            detail="Access-Control-Allow-Origin: *",
-            url=base_url,
-        ))
-    elif acao == "https://evil.example.com":
-        severity = "CRITICAL" if acac.lower() == "true" else "HIGH"
+    if acao == "https://evil.example.com":
+        with build_session(config) as confirmation_session:
+            confirmation_session.headers["Origin"] = "https://another-origin.invalid"
+            confirm, _ = fetch_response(confirmation_session, base_url, config=config)
+        if confirm is None or confirm.headers.get("Access-Control-Allow-Origin") != "https://another-origin.invalid":
+            return findings
+        severity = "MEDIUM" if acac.lower() == "true" else "INFO"
         findings.append(Finding(
             severity=severity, category="cors",
             title="CORS: arbitrary origin reflected"
                   + (" with credentials" if acac.lower() == "true" else ""),
             detail=f"ACAO: {acao}  ACAC: {acac or 'not set'}",
             url=base_url,
+            rule_id="cors.origin-reflection", confidence="firm",
+            evidence="Two distinct untrusted origins reflected; sensitive authenticated content was not verified",
+            remediation="Use an explicit trusted-origin allowlist when returning private data; review credential requirements.",
         ))
 
     return findings
@@ -1753,11 +1811,12 @@ def audit_methods(session: requests.Session, base_url: str, config: ScanConfig) 
         return findings
 
     allow = resp.headers.get("Allow", "")
-    dangerous = [m for m in ("PUT", "DELETE", "TRACE", "CONNECT") if m in allow.upper()]
+    methods = {part.strip().upper() for part in allow.split(",")}
+    dangerous = [m for m in ("PUT", "DELETE", "TRACE", "CONNECT") if m in methods]
     if dangerous:
         findings.append(Finding(
-            severity="MEDIUM", category="method",
-            title=f"Dangerous HTTP methods allowed: {', '.join(dangerous)}",
+            severity="INFO", category="method",
+            title=f"HTTP methods advertised: {', '.join(dangerous)}",
             detail=f"Allow: {allow}",
             url=base_url,
         ))
@@ -1774,14 +1833,14 @@ def check_response_body(resp: requests.Response) -> list[Finding]:
     for pattern, severity, title in BODY_PATTERNS_COMPILED:
         m = pattern.search(resp.text)
         if m:
-            start = max(0, m.start() - 40)
-            snippet = clean_snippet(resp.text[start: m.end() + 80])
             findings.append(Finding(
-                severity=severity, category="body",
+                severity="MEDIUM" if severity == "CRITICAL" else severity, category="body",
                 title=title,
-                detail=f"...{snippet}...",
+                detail="Response matched a diagnostic/sensitive-content pattern; matched values withheld",
                 url=str(resp.url),
                 status_code=resp.status_code,
+                confidence="tentative", evidence="Pattern match requires manual verification",
+                remediation="Review the response and remove unintended diagnostic or sensitive content.",
             ))
     return findings
 
@@ -1799,7 +1858,7 @@ def probe_path(
     soft_404_profiles: list[BodyFingerprint],
 ) -> Finding | None:
     session = session_pool.get()
-    url = urljoin(base_url, path.lstrip("/"))
+    url = urljoin(base_url, path)
     resp, err = fetch_response(session, url, allow_redirects=False, config=config)
     if resp is None:
         if severity in ("CRITICAL", "HIGH"):
@@ -1817,15 +1876,32 @@ def probe_path(
         return None
 
     if 200 <= sc < 300:
+        if challenge_page(resp.text):
+            if config.runtime:
+                config.runtime.mark_partial("challenge_page")
+            return None
         if is_soft_404(resp, soft_404_profiles):
             return None
         body_issues = [f.title for f in check_response_body(resp)]
+        match = sensitive_match(path, resp.text, resp.headers.get("Content-Type", ""))
+        if severity in ("CRITICAL", "HIGH") and not match:
+            return Finding(
+                severity="INFO", category="endpoint", title=f"REACHABLE: {description} (unverified)",
+                detail=f"HTTP {sc}; expected sensitive content was not confirmed", url=url,
+                status_code=sc, rule_id="endpoint.reachable." + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-"),
+                confidence="tentative", evidence="Successful response alone does not demonstrate exposure",
+                remediation="Review the endpoint and its intended access controls.",
+            )
         return Finding(
-            severity=severity, category="endpoint",
-            title=f"EXPOSED: {description}",
+            severity=severity if match else "INFO", category="endpoint",
+            title=f"{'EXPOSED' if match else 'PUBLIC'}: {description}",
             detail=f"HTTP {sc} ({resp.headers.get('Content-Type', '').split(';')[0].strip()})",
             url=url, status_code=sc,
             extra={"body_issues": body_issues} if body_issues else {},
+            rule_id=match[0] if match else "endpoint.public." + re.sub(r"[^a-z0-9]+", "-", path.lower()).strip("-"),
+            confidence="certain" if match else "tentative",
+            evidence=match[1] if match else "HTTP success; public endpoint observation",
+            remediation="Remove sensitive files from the web root and rotate affected secrets." if match else "Review whether this resource is intended to be public.",
         )
 
     if 300 <= sc < 400:
@@ -1838,15 +1914,15 @@ def probe_path(
 
     if sc in (401, 403) and severity in ("CRITICAL", "HIGH"):
         return Finding(
-            severity="LOW", category="endpoint",
+            severity="INFO", category="endpoint",
             title=f"PROTECTED: {description}",
-            detail=f"HTTP {sc} — endpoint exists but access is blocked",
+            detail=f"HTTP {sc}; access denied (resource existence is not confirmed)",
             url=url, status_code=sc,
         )
 
     if 500 <= sc <= 599:
         return Finding(
-            severity="MEDIUM", category="endpoint",
+            severity="INFO", category="endpoint",
             title=f"SERVER ERROR: {description}",
             detail=f"HTTP {sc} at endpoint",
             url=url, status_code=sc,
@@ -1882,11 +1958,13 @@ def run_endpoint_audit(
 
     if max_paths is not None:
         tasks = tasks[:max_paths]
+    if config.runtime:
+        config.runtime.endpoints_planned = len(tasks)
 
     findings: list[Finding] = []
     errors = 0
     truncated = False
-    with ThreadPoolExecutor(max_workers=workers) as pool:
+    with ScanExecutor(workers, config.runtime) as pool:
         futures: dict = {}
         task_iter = iter(tasks)
 
@@ -1929,6 +2007,8 @@ def run_endpoint_audit(
 
             for future in done:
                 path = futures.pop(future)
+                if config.runtime:
+                    config.runtime.endpoint_done()
                 if future.cancelled():
                     continue
                 try:
@@ -1939,7 +2019,7 @@ def run_endpoint_audit(
                         severity="INFO", category="endpoint",
                         title="Probe task failed",
                         detail=str(exc),
-                        url=urljoin(base_url, path.lstrip("/")),
+                        url=urljoin(base_url, path),
                     )
                 if result is not None:
                     findings.append(result)
@@ -1953,7 +2033,22 @@ def run_endpoint_audit(
             if truncated:
                 break
 
+        # Preserve results of in-flight probes that completed during shutdown.
+        for future in futures:
+            if future.cancelled():
+                continue
+            try:
+                result = future.result()
+                if result is not None:
+                    findings.append(result)
+            except Exception:
+                errors += 1
+            if config.runtime:
+                config.runtime.endpoint_done()
+
     if errors:
+        if config.runtime:
+            config.runtime.mark_partial("worker_errors")
         findings.append(Finding(
             severity="INFO", category="endpoint",
             title="Some endpoint probes failed",
@@ -1962,6 +2057,8 @@ def run_endpoint_audit(
         ))
 
     if truncated:
+        if config.runtime:
+            config.runtime.mark_partial("time_budget")
         findings.append(Finding(
             severity="INFO", category="endpoint",
             title="Time budget reached during endpoint probing",
@@ -1981,12 +2078,19 @@ def run_endpoint_audit(
 # ---------------------------------------------------------------------------
 # Discover mode helpers
 # ---------------------------------------------------------------------------
-def extract_sitemap_locs(xml_text: str) -> list[str]:
+def extract_sitemap_entries(xml_text: str) -> tuple[list[str], list[str]]:
     try:
-        root = ET.fromstring(xml_text)
-    except ET.ParseError:
-        return []
-    return [e.text.strip() for e in root.iter() if e.tag.endswith("loc") and e.text]
+        root = parse_xml(xml_text)
+    except (ET.ParseError, DefusedXmlException):
+        return [], []
+    kind = root.tag.rsplit("}", 1)[-1]
+    locations = [e.text.strip() for e in root.iter() if e.tag.rsplit("}", 1)[-1] == "loc" and e.text]
+    return (locations, []) if kind == "sitemapindex" else ([], locations) if kind == "urlset" else ([], [])
+
+
+def extract_sitemap_locs(xml_text: str) -> list[str]:
+    nested, pages = extract_sitemap_entries(xml_text)
+    return nested + pages
 
 
 def crawl_sitemaps(
@@ -2012,18 +2116,27 @@ def crawl_sitemaps(
         if time_budget and time_budget.exhausted():
             break
         sm = queue.pop(0)
+        if not is_internal(sm, base_url):
+            continue
+        sm = normalize_url(sm, base_url)
         if sm in seen_maps:
             continue
+        if len(seen_maps) >= 100:
+            if config.runtime:
+                config.runtime.mark_partial("sitemap_limit")
+            break
         seen_maps.add(sm)
         xml = fetch_text(session, sm, config)
         if not xml:
             continue
-        for loc in extract_sitemap_locs(xml):
+        nested, pages = extract_sitemap_entries(xml)
+        for loc in nested:
+            if is_internal(loc, base_url):
+                queue.append(normalize_url(loc, sm))
+        for loc in pages:
             if time_budget and time_budget.exhausted():
                 break
-            if loc.endswith(".xml"):
-                queue.append(loc)
-            elif is_content_url(loc, base_url):
+            if is_content_url(loc, base_url):
                 urls.add(normalize_url(loc, base_url))
     return urls
 
@@ -2042,21 +2155,24 @@ def crawl_feeds(
         href = str(tag["href"]).strip()
         if is_internal(href, base_url):
             feed_urls.append(urljoin(base_url, href))
-    for feed_url in feed_urls:
+    for feed_url in dict.fromkeys(feed_urls):
         if time_budget and time_budget.exhausted():
             break
         xml = fetch_text(session, feed_url, config)
         if not xml:
             continue
         try:
-            root = ET.fromstring(xml)
-        except ET.ParseError:
+            root = parse_xml(xml)
+        except (ET.ParseError, DefusedXmlException):
             continue
         for elem in root.iter():
             if time_budget and time_budget.exhausted():
                 break
-            if elem.tag.endswith("link") and elem.text and is_content_url(elem.text, base_url):
-                urls.add(normalize_url(elem.text, base_url))
+            if elem.tag.rsplit("}", 1)[-1] != "link" or elem.get("rel", "alternate") != "alternate":
+                continue
+            candidate = elem.get("href") or elem.text
+            if candidate and is_content_url(candidate.strip(), base_url):
+                urls.add(normalize_url(candidate.strip(), feed_url))
     return urls
 
 
@@ -2083,7 +2199,9 @@ def fetch_api_urls(
             payload = resp.json()
         except ValueError:
             continue
-        rows = payload if isinstance(payload, list) else payload.get("data", [])
+        rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+        if not isinstance(rows, list):
+            continue
         for item in rows:
             if time_budget and time_budget.exhausted():
                 break
@@ -2112,11 +2230,8 @@ def _is_ip_address(host: str) -> bool:
 
 
 def _base_domain(host: str) -> str:
-    parts = host.split(".")
-    if len(parts) <= 2:
-        return host
-    # Heuristic: keep the last two labels (may be imperfect for some TLDs).
-    return ".".join(parts[-2:])
+    extracted = EXTRACT_DOMAIN(host)
+    return extracted.top_domain_under_public_suffix
 
 
 def discover_subdomains(
@@ -2129,6 +2244,8 @@ def discover_subdomains(
     if not host or _is_ip_address(host):
         return set()
     base = _base_domain(host)
+    if not base:
+        return set()
     scheme = parsed.scheme or "https"
     results: set[str] = set()
     for prefix in prefixes:
@@ -2203,16 +2320,7 @@ def normalize_base_url(raw_url: str) -> str:
     if "://" not in url:
         url = "https://" + url
 
-    parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https"):
-        raise ValueError("Only http and https URLs are supported")
-    if not parsed.netloc:
-        raise ValueError("URL host is missing")
-
-    path = parsed.path or "/"
-    if not path.endswith("/"):
-        path += "/"
-    return f"{parsed.scheme}://{parsed.netloc}{path}"
+    return canonical_url(url)
 
 
 def print_findings(findings: list[Finding]) -> None:
@@ -2236,17 +2344,32 @@ def print_summary(findings: list[Finding]) -> None:
     counts = {sev: sum(1 for f in findings if f.severity == sev) for sev in SEVERITY_ORDER}
     parts = [f"{c(sev, sev)}: {counts[sev]}" for sev in SEVERITY_ORDER if counts[sev]]
     if parts:
-        print(f"\nSummary — {' | '.join(parts)}")
+        print(f"\nSummary: {' | '.join(parts)}")
     else:
-        print("\nSummary — no findings")
+        print("\nSummary: no findings")
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
-def parse_args() -> argparse.Namespace:
+def add_request_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--rate-limit", type=float, default=10.0, help="Maximum HTTP requests per second across all workers (default: 10)")
+    parser.add_argument("--max-requests", type=int, default=1000, help="Total HTTP request cap including redirects/retries (default: 1000)")
+    parser.add_argument("--max-body-bytes", type=int, default=1_048_576, help="Maximum decoded response bytes (default: 1048576)")
+    parser.add_argument("--system-proxy", action=argparse.BooleanOptionalAction, default=False, help="Opt into environment/system/PAC proxy settings")
+    parser.add_argument("--strict", action=argparse.BooleanOptionalAction, default=False, help="Exit 3 when a scan is partial and no fail-on threshold is hit")
+
+
+def record_provided_options(args: argparse.Namespace, parser: argparse.ArgumentParser, tokens: list[str]) -> None:
+    options = {token.split("=", 1)[0] for token in tokens if token.startswith("--")}
+    args._provided = {action.dest for action in parser._actions if options.intersection(action.option_strings)}
+
+
+def build_parser(*, exit_on_error: bool = True) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=APP_NAME,
+        exit_on_error=exit_on_error,
+        allow_abbrev=False,
         description=(
             "Authorized web site exposure auditor.\n"
             "Inspired by nuclei, gobuster, wappalyzer, and nikto.\n\n"
@@ -2293,7 +2416,7 @@ def parse_args() -> argparse.Namespace:
         help=f"Retries on transient HTTP errors (default: {RETRIES})",
     )
     parser.add_argument(
-        "--insecure", action="store_true",
+        "--insecure", action=argparse.BooleanOptionalAction, default=False,
         help="Disable SSL certificate verification",
     )
     parser.add_argument(
@@ -2301,7 +2424,7 @@ def parse_args() -> argparse.Namespace:
         help="Exit with code 2 if findings at/above this severity exist (for CI)",
     )
     parser.add_argument(
-        "--verbose", action="store_true",
+        "--verbose", action=argparse.BooleanOptionalAction, default=False,
         help="Enable verbose logging",
     )
     parser.add_argument(
@@ -2348,6 +2471,8 @@ def parse_args() -> argparse.Namespace:
         "--bearer-token", metavar="TOKEN", default=None,
         help="Bearer token for Authorization header",
     )
+    parser.add_argument("--bearer-token-env", metavar="NAME", help="Read bearer token from environment variable NAME")
+    parser.add_argument("--basic-pass-env", metavar="NAME", help="Read basic-auth password from environment variable NAME")
     parser.add_argument(
         "--cookie", metavar="COOKIE", action="append", default=[],
         help="Cookie header value (repeatable, e.g. 'session=abc; theme=dark')",
@@ -2381,7 +2506,7 @@ def parse_args() -> argparse.Namespace:
         help="Simulate scan without making requests (useful for configuration testing)",
     )
     parser.add_argument(
-        "--discover-subdomains", action="store_true",
+        "--discover-subdomains", action=argparse.BooleanOptionalAction, default=False,
         help="Discover common subdomains (discover mode only)",
     )
     parser.add_argument(
@@ -2392,7 +2517,16 @@ def parse_args() -> argparse.Namespace:
         "--last-scope", choices=["user", "project", "both"], default="both",
         help="Where to save the last report (default: both)",
     )
-    return parser.parse_args()
+    add_request_options(parser)
+    return parser
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = build_parser()
+    tokens = sys.argv[1:] if argv is None else argv
+    args = parser.parse_args(tokens)
+    record_provided_options(args, parser, tokens)
+    return args
 
 
 def run_scan(args: argparse.Namespace) -> int:
@@ -2405,16 +2539,18 @@ def run_scan(args: argparse.Namespace) -> int:
 
     setup_logging(args.verbose, args.log_file)
     start_time = datetime.now(timezone.utc)
+    start_monotonic = time.monotonic()
 
     profile = getattr(args, "profile", "standard")
     profile_defaults = PROFILE_DEFAULTS.get(profile, PROFILE_DEFAULTS["standard"])
 
-    workers = args.workers if args.workers != MAX_WORKERS else profile_defaults["workers"]
-    timeout = args.timeout if args.timeout != TIMEOUT else profile_defaults["timeout"]
-    retries = args.retries if args.retries != RETRIES else profile_defaults["retries"]
-    workers = max(1, min(workers, 200))
-    timeout = max(1, timeout)
-    retries = max(0, retries)
+    configured = getattr(args, "_configured", getattr(args, "_provided", set()))
+    workers = args.workers if "workers" in configured else profile_defaults["workers"]
+    timeout = args.timeout if "timeout" in configured else profile_defaults["timeout"]
+    retries = args.retries if "retries" in configured else profile_defaults["retries"]
+    if not 1 <= workers <= 200 or timeout <= 0 or not 0 <= retries <= 10:
+        print("[ERROR] workers must be 1..200, timeout positive, and retries 0..10")
+        return 1
     min_idx = SEVERITY_ORDER.index(args.min_severity)
 
     time_budget_seconds = args.time_budget if args.time_budget is not None else profile_defaults["time_budget"]
@@ -2422,6 +2558,13 @@ def run_scan(args: argparse.Namespace) -> int:
         print(c("CRITICAL", "[ERROR] time-budget must be greater than 0 seconds"))
         return 1
     time_budget = TimeBudget(time_budget_seconds)
+    rate_limit = getattr(args, "rate_limit", 10.0)
+    max_requests = getattr(args, "max_requests", 1000)
+    max_body_bytes = getattr(args, "max_body_bytes", 1_048_576)
+    if not 0 < rate_limit <= 10000 or not 1 <= max_requests <= 1_000_000 or not 1024 <= max_body_bytes <= 100_000_000:
+        print("[ERROR] rate-limit must be 0..10000 (exclusive of 0), max-requests 1..1000000, max-body-bytes 1024..100000000")
+        return 1
+    runtime = ScanRuntime(time_budget, rate_limit=rate_limit, max_requests=max_requests)
     max_paths = profile_defaults.get("max_paths")
     
     try:
@@ -2441,11 +2584,22 @@ def run_scan(args: argparse.Namespace) -> int:
 
     basic_user = getattr(args, "basic_user", None)
     basic_pass = getattr(args, "basic_pass", None)
+    bearer_token = getattr(args, "bearer_token", None)
+    for direct, env_name, label in ((basic_pass, getattr(args, "basic_pass_env", None), "basic-pass"), (bearer_token, getattr(args, "bearer_token_env", None), "bearer-token")):
+        if env_name and (direct is not None or not _os.environ.get(env_name)):
+            print(f"[ERROR] {label}: use either a direct value or a populated environment variable")
+            return 1
+    if getattr(args, "basic_pass_env", None):
+        basic_pass = _os.environ[args.basic_pass_env]
+    if getattr(args, "bearer_token_env", None):
+        bearer_token = _os.environ[args.bearer_token_env]
     if (basic_user and not basic_pass) or (basic_pass and not basic_user):
         print(c("CRITICAL", "[ERROR] Both --basic-user and --basic-pass are required"))
         return 1
     auth = (basic_user, basic_pass) if basic_user and basic_pass else None
-    bearer_token = getattr(args, "bearer_token", None)
+    if auth and bearer_token:
+        print("[ERROR] Choose basic authentication or bearer authentication")
+        return 1
     cookie_values = getattr(args, "cookie", []) or []
     cookie_jar = parse_cookie_values(cookie_values) if cookie_values else None
     
@@ -2458,6 +2612,10 @@ def run_scan(args: argparse.Namespace) -> int:
         auth=auth,
         bearer_token=bearer_token,
         cookies=cookie_jar,
+        scope=ScanScope(base_url), runtime=runtime, max_body_bytes=max_body_bytes,
+        system_proxy=getattr(args, "system_proxy", False) and not getattr(args, "dry_run", False),
+        allow_initial_upgrade=True,
+        allow_initial_canonical_redirect=True,
     )
     fail_on = args.fail_on
     output_format = getattr(args, 'format', 'json')
@@ -2466,12 +2624,14 @@ def run_scan(args: argparse.Namespace) -> int:
     report_brand = getattr(args, "report_brand", "site-audit")
     report_logo = getattr(args, "report_logo", None)
     output_path, output_format = normalize_output_target(args.output, output_format)
+    if args.mode == "discover" and output_format not in ("json", "html"):
+        print("[ERROR] Discover mode supports json or html output")
+        return 1
 
     # Suppress urllib3 warnings globally (connection pool, retries, etc)
     # They are logged but not useful to end users
-    urllib3.disable_warnings()
-    
     if args.insecure:
+        urllib3.disable_warnings(InsecureRequestWarning)
         LOGGER.warning("TLS certificate verification disabled")
 
     if dry_run:
@@ -2479,6 +2639,7 @@ def run_scan(args: argparse.Namespace) -> int:
         LOGGER.info("Dry-run mode enabled")
 
     LOGGER.info("Starting %s scan for %s", args.mode, base_url)
+    startup_findings: list[Finding] = []
 
     with build_session(config) as session:
         if dry_run:
@@ -2489,20 +2650,55 @@ def run_scan(args: argparse.Namespace) -> int:
             
         if not dry_run:
             if homepage is None:
-                print(c("CRITICAL", f"[ERROR] Could not connect to {base_url}"))
+                runtime.mark_partial("initial_connection_failed")
+                finished_time = datetime.now(timezone.utc)
+                failed_report = {
+                    "schema_version": REPORT_SCHEMA_VERSION,
+                    "tool": {"name": APP_NAME, "version": __version__},
+                    "target": base_url, "mode": args.mode, "settings": {}, "findings": [], "ports": {},
+                    "started_at": start_time.isoformat(), "finished_at": finished_time.isoformat(),
+                    "timestamp": finished_time.isoformat(), "duration_seconds": time.monotonic() - start_monotonic,
+                    "scan": runtime.snapshot(),
+                }
+                if args.mode == "discover":
+                    failed_report["result"] = {"homepage_internal_links": [], "discovered": [], "subdomains": [], "hidden": []}
+                if output_path:
+                    write_report(failed_report, output_path, output_format, report_title=report_title, report_brand=report_brand, report_logo=report_logo)
+                print(c("CRITICAL", f"[ERROR] Could not open target {base_url}"))
                 # Simplify error message - show just the core issue, not full stack
                 if fetch_err:
-                    short_err = fetch_err.split(':')[0] if ':' in fetch_err else fetch_err
-                    print(f"       {short_err}")
+                    print(f"       {fetch_err}")
                     if "timeout" in fetch_err.lower():
                         print(f"       Tip: Try --timeout {max(int(args.timeout) + 5, 15)} for slow networks")
                 if args.insecure:
                     print("       SSL verification is disabled (--insecure).")
                 return 1
             if not homepage.ok:
+                runtime.mark_partial("homepage_http_error")
                 print(c("HIGH", f"[WARN] Homepage returned HTTP {homepage.status_code} for {base_url}"))
-                print(f"       The tool will continue, but results may be incomplete.")
+                print("       The tool will continue, but results may be incomplete.")
                 LOGGER.warning("Homepage returned HTTP %s", homepage.status_code)
+            blocked_redirect = getattr(homepage, "_audit_blocked_redirect", None)
+            if blocked_redirect:
+                print(c("INFO", f"[WARN] Homepage redirects outside scope to {blocked_redirect}"))
+                print("       Continuing on the original site; homepage coverage is incomplete.")
+                startup_findings.append(Finding(
+                    severity="INFO", category="scope", title="Homepage redirect outside scan scope",
+                    detail="External consent/login or other redirect was not followed; homepage checks are incomplete",
+                    url=homepage.url, status_code=homepage.status_code,
+                    rule_id="scope.startup-redirect", confidence="certain",
+                    evidence=f"Redirect destination: {blocked_redirect}",
+                    remediation="Review the redirect and provide an in-scope starting URL or authenticated session if needed.",
+                ))
+            if challenge_page(homepage.text):
+                runtime.mark_partial("challenge_page")
+            # Canonicalization is limited to startup; subsequent probes use one exact origin.
+            if canonical_url(homepage.url) != base_url:
+                print(c("INFO", f"[INFO] Canonical target: {redacted_url(homepage.url)}"))
+            base_url = canonical_url(homepage.url)
+            config.scope = ScanScope(base_url)
+            config.allow_initial_upgrade = False
+            config.allow_initial_canonical_redirect = False
 
             if args.mode == "discover":
                 print(f"Mode: public URL discovery\nTarget: {base_url}\n")
@@ -2516,7 +2712,7 @@ def run_scan(args: argparse.Namespace) -> int:
                     subdomain_prefixes=DISCOVER_SUBDOMAIN_PREFIXES,
                 )
                 finished_time = datetime.now(timezone.utc)
-                duration_seconds = (finished_time - start_time).total_seconds()
+                duration_seconds = time.monotonic() - start_monotonic
                 settings_payload = {
                     "profile": profile,
                     "workers": workers,
@@ -2526,8 +2722,9 @@ def run_scan(args: argparse.Namespace) -> int:
                     "min_severity": args.min_severity,
                     "fail_on": fail_on,
                     "time_budget": time_budget_seconds,
-                    "proxy": config.proxy,
+                    "proxy": redacted_url(config.proxy) if config.proxy else None,
                     "custom_headers": len(config.custom_headers),
+                    "rate_limit": rate_limit, "max_requests": max_requests, "max_body_bytes": max_body_bytes,
                 }
                 report_payload = {
                     "schema_version": REPORT_SCHEMA_VERSION,
@@ -2540,38 +2737,20 @@ def run_scan(args: argparse.Namespace) -> int:
                     "started_at": start_time.isoformat(),
                     "finished_at": finished_time.isoformat(),
                     "duration_seconds": duration_seconds,
+                    "scan": runtime.snapshot(),
+                    "findings": [asdict(f) for f in startup_findings],
                 }
                 if output_path:
-                    if output_format == "html":
-                        write_html_report(
-                            output_path,
-                            mode="discover",
-                            target=base_url,
-                            platforms=[],
-                            settings=settings_payload,
-                            discover_result=result,
-                            started_at=start_time,
-                            finished_at=finished_time,
-                            duration_seconds=duration_seconds,
-                            report_title=report_title,
-                            report_brand=report_brand,
-                            report_logo=report_logo,
-                        )
-                        print(f"HTML report written to {output_path}")
-                    else:
-                        if output_format not in ("json", "html"):
-                            print(c("INFO", "[INFO] Discover mode supports json/html; writing JSON output"))
-                        write_json_atomic(output_path, report_payload)
-                        print(f"JSON report written to {output_path}")
+                    write_report(report_payload, output_path, output_format, report_title=report_title, report_brand=report_brand, report_logo=report_logo)
                 if not getattr(args, "no_save_last", False):
                     try:
                         save_last_report(report_payload, getattr(args, "last_scope", "both"))
                     except OSError:
                         print("[WARN] Failed to save last report")
                 LOGGER.info("Discover mode finished")
-                return 0
+                return 3 if getattr(args, "strict", False) and report_payload["scan"]["status"] == "partial" else 0
 
-        platforms, tech_findings = fingerprint(homepage, session) if (not dry_run and homepage) else ([], [])
+        platforms, tech_findings = fingerprint(homepage, session) if (not dry_run and homepage is not None and 200 <= homepage.status_code < 300 and not challenge_page(homepage.text)) else ([], [])
         soft_404_profiles: list[BodyFingerprint] = []
         if not dry_run:
             soft_404_profiles = build_soft_404_profiles(
@@ -2595,11 +2774,13 @@ def run_scan(args: argparse.Namespace) -> int:
             print(c("INFO", f"  Budget   : {time_budget_seconds}s"))
         print(c("INFO", f"  Verify   : {'on' if config.verify_ssl else 'off'}"))
         if config.proxy:
-            print(c("INFO", f"  Proxy    : {config.proxy}"))
+            print(c("INFO", f"  Proxy    : {redacted_url(config.proxy)}"))
         print(c("INFO", "=" * 64))
         print()
 
         all_findings: list[Finding] = []
+        all_findings += startup_findings
+        port_results: dict[int, bool | None] = {}
         
         # Port scanning
         if port_list and not dry_run and not time_budget.exhausted():
@@ -2607,18 +2788,19 @@ def run_scan(args: argparse.Namespace) -> int:
                 parsed_url = urlparse(base_url)
                 host = parsed_url.hostname or ""
                 print(f"Scanning {len(port_list)} ports on {host}...")
-                port_results = scan_ports(host, port_list, timeout=2.0)
-                open_ports = [p for p, is_open in port_results.items() if is_open]
+                port_results = scan_ports(host, port_list, timeout=2.0, runtime=runtime)
+                open_ports = [p for p, is_open in port_results.items() if is_open is True]
                 if open_ports:
                     print(f"Open ports: {', '.join(map(str, sorted(open_ports)))}")
             except Exception as e:
+                runtime.mark_partial("port_errors")
                 LOGGER.error(f"Port scanning failed: {e}")
         
         if dry_run:
             print("[DRY-RUN] Skipping endpoint audits")
         else:
             all_findings += tech_findings
-            if homepage:
+            if homepage is not None and 200 <= homepage.status_code < 300 and not challenge_page(homepage.text):
                 all_findings += audit_security_headers(homepage)
                 all_findings += audit_cookies(homepage)
                 all_findings += audit_cache_headers(homepage)
@@ -2661,7 +2843,7 @@ def run_scan(args: argparse.Namespace) -> int:
         print_summary(filtered)
 
         finished_time = datetime.now(timezone.utc)
-        duration_seconds = (finished_time - start_time).total_seconds()
+        duration_seconds = time.monotonic() - start_monotonic
         settings_payload = {
             "profile": profile,
             "workers": workers,
@@ -2671,49 +2853,33 @@ def run_scan(args: argparse.Namespace) -> int:
             "min_severity": args.min_severity,
             "fail_on": fail_on,
             "time_budget": time_budget_seconds,
-            "proxy": config.proxy,
+            "proxy": redacted_url(config.proxy) if config.proxy else None,
             "custom_headers": len(config.custom_headers),
+            "rate_limit": rate_limit, "max_requests": max_requests, "max_body_bytes": max_body_bytes,
         }
         report_payload = {
             "schema_version": REPORT_SCHEMA_VERSION,
             "tool": {"name": APP_NAME, "version": __version__},
             "target": base_url,
             "timestamp": finished_time.isoformat(),
-            "mode": "audit",
+            "mode": args.mode,
             "platforms": platforms,
             "settings": settings_payload,
-            "findings": [asdict(f) for f in filtered],
+            "findings": [asdict(f) for f in all_findings],
             "started_at": start_time.isoformat(),
             "finished_at": finished_time.isoformat(),
             "duration_seconds": duration_seconds,
+            "scan": runtime.snapshot(dry_run),
+            "ports": {str(port): state for port, state in port_results.items()},
         }
+        if dry_run and args.mode == "discover":
+            report_payload["result"] = {"homepage_internal_links": [], "discovered": [], "subdomains": [], "hidden": []}
+        print(f"Scan status: {report_payload['scan']['status']} ({runtime.requests_sent} HTTP requests)")
+        if report_payload["scan"]["reasons"]:
+            print("Incomplete checks: " + ", ".join(report_payload["scan"]["reasons"]))
 
         if output_path:
-            if output_format == "json":
-                write_json_atomic(output_path, report_payload)
-                print(f"JSON report written to {output_path}")
-            elif output_format == "csv":
-                write_csv(output_path, filtered)
-                print(f"CSV report written to {output_path}")
-            elif output_format == "xml":
-                write_xml(output_path, filtered, base_url)
-                print(f"XML report written to {output_path}")
-            elif output_format == "html":
-                write_html_report(
-                    output_path,
-                    mode="audit",
-                    target=base_url,
-                    platforms=platforms,
-                    settings=settings_payload,
-                    findings=filtered,
-                    started_at=start_time,
-                    finished_at=finished_time,
-                    duration_seconds=duration_seconds,
-                    report_title=report_title,
-                    report_brand=report_brand,
-                    report_logo=report_logo,
-                )
-                print(f"HTML report written to {output_path}")
+            write_report(report_payload, output_path, output_format, report_title=report_title, report_brand=report_brand, report_logo=report_logo)
 
         if not getattr(args, "no_save_last", False):
             try:
@@ -2724,6 +2890,8 @@ def run_scan(args: argparse.Namespace) -> int:
         if fail_on and has_findings_at_or_above(all_findings, fail_on):
             LOGGER.warning("Fail-on threshold hit: %s", fail_on)
             return 2
+        if getattr(args, "strict", False) and report_payload["scan"]["status"] == "partial":
+            return 3
 
         LOGGER.info("Audit finished successfully")
         return 0
@@ -2731,35 +2899,44 @@ def run_scan(args: argparse.Namespace) -> int:
 
 INTERACTIVE_HELP = """
 Commands:
-  scan <url> [options]      run scan using saved defaults + optional overrides
-  audit <url> [options]     same as scan, forced --mode audit
-  discover <url> [options]  same as scan, forced --mode discover
-    export <file> [options]   export last report to file
-    set <key> <value>         persist default option (workers, timeout, ...)
-  unset <key>               remove optional default (output, fail-on, log-file)
+  scan <url> [options]       run with session defaults and optional overrides
+  audit <url> [options]      force audit mode
+  discover <url> [options]   force public URL discovery
+  export <file> [options]    export the last stored report
+  set <key> <value>          change a default; save unless --no-save-prefs
+  unset <key>               restore a built-in default
   show config               print current interactive defaults
   history                   show current session command history
+  history clear             clear current and configured persistent history
   clear                     clear screen
   help                      show this message
-  exit / quit / Ctrl-C      leave
+  version                   show the version without leaving the session
+  exit / quit / EOF         leave; Ctrl-C cancels the current prompt/scan
 
-Common keys for 'set':
-    mode, profile, format, min-severity, workers, timeout, time-budget,
-    retries, insecure, fail-on, verbose, log-file, output,
-    report-title, report-brand, report-logo
+Settings:
+  mode, profile, format, min-severity, fail-on, workers, timeout, retries,
+  rate-limit, max-requests, max-body-bytes, time-budget, ports, strict,
+  insecure, proxy, system-proxy, discover-subdomains, verbose, log-file,
+  output, report-title, report-brand, report-logo
 
-Defaults are saved to ~/.site_audit_config.json and ./.site_audit.json
+Boolean values: true/false. Use --no-strict, --no-insecure, etc. to override
+a true default for one command. Proxy credentials are never saved as defaults.
+CLI authentication and privacy flags carry into this session's scans.
+Preferences: ~/.site_audit_config.json and ./.site_audit.json, controlled by
+--no-load-prefs, --no-save-prefs, and --prefs-scope.
 
 Examples:
-  set workers 40
-    set profile quick
-    set format html
-  set mode audit
+  set profile quick
+  set rate-limit 2
+  set strict true
   show config
   scan https://example.com
   discover https://example.com --output discover.json
-    export report.html --format html
+  export report.html --format html --export-scope project
   audit https://example.com --fail-on HIGH
+
+Exits: 1 operational/configuration error, 2 finding threshold, 3 strict partial
+scan, 130 interruption. Reports retain all findings; min-severity filters display.
 """.strip()
 
 
@@ -2772,48 +2949,85 @@ def parse_bool(value: str) -> bool:
     raise ValueError("expected boolean value: true/false")
 
 
+def split_interactive_line(line: str, *, windows: bool | None = None) -> list[str]:
+    lexer = shlex.shlex(line, posix=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    is_windows = windows if windows is not None else _os.name == "nt"
+    if is_windows:
+        lexer.escape = ""
+    return list(lexer)
+
+
+def redact_history_line(line: str) -> str:
+    try:
+        tokens = split_interactive_line(line)
+    except ValueError:
+        return "<unparsed command omitted>"
+    secret_flags = {"--basic-user", "--basic-pass", "--bearer-token", "--cookie", "--header", "--proxy"}
+    result = []
+    skip = False
+    for token in tokens:
+        if skip:
+            skip = False
+            continue
+        flag, separator, _value = token.partition("=")
+        if flag in secret_flags:
+            result.extend([flag, "<redacted>"])
+            skip = not separator
+        else:
+            try:
+                parsed = urlparse(token)
+                if parsed.username is not None or parsed.password is not None:
+                    token = redacted_url(token)
+            except ValueError:
+                token = "<invalid URL omitted>"
+            result.append(token)
+    return shlex.join(result)
+
+
 def build_interactive_tokens(url: str, state: InteractiveState, extra_tokens: list[str]) -> list[str]:
     tokens = [url]
-
-    if state["mode"] != "audit":
-        tokens += ["--mode", str(state["mode"])]
-    if state["profile"] != "standard":
-        tokens += ["--profile", str(state["profile"])]
-    if state["output"]:
-        tokens += ["--output", str(state["output"])]
-    if state["format"] != "json":
-        tokens += ["--format", str(state["format"])]
-    if state["min_severity"] != "INFO":
-        tokens += ["--min-severity", str(state["min_severity"])]
-    if int(state["workers"]) != MAX_WORKERS:
-        tokens += ["--workers", str(state["workers"])]
-    if int(state["timeout"]) != TIMEOUT:
-        tokens += ["--timeout", str(state["timeout"])]
-    if state["time_budget"] is not None:
-        tokens += ["--time-budget", str(state["time_budget"])]
-    if int(state["retries"]) != RETRIES:
-        tokens += ["--retries", str(state["retries"])]
-    if bool(state["insecure"]):
-        tokens += ["--insecure"]
-    if state["fail_on"]:
-        tokens += ["--fail-on", str(state["fail_on"])]
-    if bool(state["verbose"]):
-        tokens += ["--verbose"]
-    if state["log_file"]:
-        tokens += ["--log-file", str(state["log_file"])]
-    if state["report_title"] != "Security Exposure Report":
-        tokens += ["--report-title", str(state["report_title"])]
-    if state["report_brand"] != "site-audit":
-        tokens += ["--report-brand", str(state["report_brand"])]
-    if state["report_logo"]:
-        tokens += ["--report-logo", str(state["report_logo"])]
-
+    explicit = state.get("_provided", set())
+    for key in PREF_KEYS:
+        value = state.get(key, PREF_DEFAULTS[key])
+        if value is None or (key not in explicit and value == PREF_DEFAULTS[key]):
+            continue
+        flag = "--" + key.replace("_", "-")
+        if isinstance(value, bool):
+            tokens.append(flag if value else "--no-" + key.replace("_", "-"))
+        else:
+            tokens += [flag, str(value)]
     tokens.extend(extra_tokens)
     return tokens
 
 
 def update_interactive_setting(state: InteractiveState, key: str, value: str) -> str:
+    normalized = _update_interactive_setting(state, key, value)
+    state.setdefault("_provided", set()).add(normalized.replace("-", "_"))
+    return normalized
+
+
+def _update_interactive_setting(state: InteractiveState, key: str, value: str) -> str:
     k = key.strip().lower().replace("_", "-")
+    if k in ("rate-limit", "max-requests", "max-body-bytes"):
+        numeric = float(value) if k == "rate-limit" else int(value)
+        limits = {"rate-limit": (0, 10000), "max-requests": (0, 1_000_000), "max-body-bytes": (1023, 100_000_000)}
+        low, high = limits[k]
+        if not low < numeric <= high:
+            raise ValueError(f"{k} must be greater than {low} and at most {high}")
+        state[k.replace("-", "_")] = numeric
+        return k
+    if k in ("strict", "system-proxy", "discover-subdomains"):
+        state[k.replace("-", "_")] = parse_bool(value)
+        return k
+    if k == "ports":
+        get_ports_for_url("https://example.com/", value)
+        state["ports"] = value
+        return k
+    if k == "proxy":
+        state["proxy"] = validate_proxy_url(value)
+        return k
     if k == "mode":
         if value not in ("audit", "discover"):
             raise ValueError("mode must be audit or discover")
@@ -2835,16 +3049,24 @@ def update_interactive_setting(state: InteractiveState, key: str, value: str) ->
         state["min_severity"] = value
         return "min-severity"
     if k == "workers":
-        state["workers"] = max(1, min(int(value), 200))
+        if not 1 <= int(value) <= 200:
+            raise ValueError("workers must be 1..200")
+        state["workers"] = int(value)
         return "workers"
     if k == "timeout":
-        state["timeout"] = max(1, int(value))
+        if int(value) <= 0:
+            raise ValueError("timeout must be positive")
+        state["timeout"] = int(value)
         return "timeout"
     if k in ("time-budget", "timebudget"):
-        state["time_budget"] = max(1, int(value))
+        if int(value) <= 0:
+            raise ValueError("time-budget must be positive")
+        state["time_budget"] = int(value)
         return "time-budget"
     if k == "retries":
-        state["retries"] = max(0, int(value))
+        if not 0 <= int(value) <= 10:
+            raise ValueError("retries must be 0..10")
+        state["retries"] = int(value)
         return "retries"
     if k == "insecure":
         state["insecure"] = parse_bool(value)
@@ -2877,25 +3099,13 @@ def update_interactive_setting(state: InteractiveState, key: str, value: str) ->
 
 def unset_interactive_setting(state: InteractiveState, key: str) -> str:
     k = key.strip().lower().replace("_", "-")
-    if k in ("output", "fail-on", "failon", "log-file", "logfile", "report-title", "report-brand", "report-logo"):
-        if k == "output":
-            state["output"] = None
-            return "output"
-        if k in ("fail-on", "failon"):
-            state["fail_on"] = None
-            return "fail-on"
-        if k in ("log-file", "logfile"):
-            state["log_file"] = None
-            return "log-file"
-        if k in ("report-title", "reporttitle"):
-            state["report_title"] = "Security Exposure Report"
-            return "report-title"
-        if k in ("report-brand", "reportbrand"):
-            state["report_brand"] = "site-audit"
-            return "report-brand"
-        state["report_logo"] = None
-        return "report-logo"
-    raise ValueError("Only output, fail-on, log-file, and report branding can be unset")
+    k = {"failon": "fail-on", "logfile": "log-file", "reporttitle": "report-title", "reportbrand": "report-brand", "reportlogo": "report-logo"}.get(k, k)
+    pref_key = k.replace("-", "_")
+    if pref_key not in PREF_DEFAULTS:
+        raise ValueError("Unknown setting")
+    state[pref_key] = PREF_DEFAULTS[pref_key]
+    state.setdefault("_provided", set()).discard(pref_key)
+    return k
 
 
 def print_interactive_config(state: InteractiveState) -> None:
@@ -2916,12 +3126,15 @@ def print_interactive_config(state: InteractiveState) -> None:
     print(f"  report-title : {state['report_title']}")
     print(f"  report-brand : {state['report_brand']}")
     print(f"  report-logo  : {state['report_logo'] or '-'}")
+    for key in ("rate_limit", "max_requests", "max_body_bytes", "ports", "system_proxy", "strict", "discover_subdomains"):
+        print(f"  {key.replace('_', '-'):<13}: {state.get(key, PREF_DEFAULTS[key])}")
+    print(f"  proxy        : {redacted_url(state['proxy']) if state.get('proxy') else '-'}")
 
 
 def create_prompt_session(history_enabled: bool, history_path: str):
     if not HAS_PROMPT_TOOLKIT:
         return None
-    pt_history = PT_FileHistory(history_path) if history_enabled else PT_DummyHistory()
+    pt_history = RedactedFileHistory(history_path) if history_enabled else PT_DummyHistory()
     return PT_PromptSession(
         completer=SiteAuditCompleter(),
         history=pt_history,
@@ -2932,41 +3145,14 @@ def create_prompt_session(history_enabled: bool, history_path: str):
         search_ignore_case=True
     )
 
-def interactive_mode(default_workers: int, history_enabled: bool = False) -> None:
+def interactive_mode(default_workers: int, history_enabled: bool = False, initial_args: argparse.Namespace | None = None) -> None:
     print(c("INFO", "=" * 64))
-    print(c("INFO", f"  {APP_NAME} v{__version__}  —  interactive mode"))
+    print(c("INFO", f"  {APP_NAME} v{__version__} - interactive mode"))
     print(c("INFO", "  type a URL to scan, 'help' for options, 'exit' to quit"))
     print(c("INFO", "=" * 64))
 
-    parser = argparse.ArgumentParser(exit_on_error=False, add_help=False)
-    parser.add_argument("url")
-    parser.add_argument("--mode", choices=["audit", "discover"], default="audit")
-    parser.add_argument("--profile", choices=["quick", "standard", "deep"], default="standard")
-    parser.add_argument("--output", metavar="FILE", default=None)
-    parser.add_argument("--format", choices=["json", "csv", "xml", "html"], default="json")
-    parser.add_argument("--min-severity", choices=SEVERITY_ORDER, default="INFO")
-    parser.add_argument("--workers", type=int, default=default_workers)
-    parser.add_argument("--timeout", type=int, default=TIMEOUT)
-    parser.add_argument("--time-budget", type=int, default=None)
-    parser.add_argument("--retries", type=int, default=RETRIES)
-    parser.add_argument("--insecure", action="store_true")
-    parser.add_argument("--fail-on", choices=SEVERITY_ORDER, default=None)
-    parser.add_argument("--verbose", action="store_true")
-    parser.add_argument("--log-file", metavar="FILE", default=None)
-    parser.add_argument("--history", action="store_true")
-    parser.add_argument("--no-load-prefs", action="store_true")
-    parser.add_argument("--no-save-prefs", action="store_true")
-    parser.add_argument("--prefs-scope", choices=["user", "project", "both"], default="both")
-    parser.add_argument("--basic-user", metavar="USER", default=None)
-    parser.add_argument("--basic-pass", metavar="PASS", default=None)
-    parser.add_argument("--bearer-token", metavar="TOKEN", default=None)
-    parser.add_argument("--cookie", metavar="COOKIE", action="append", default=[])
-    parser.add_argument("--report-title", metavar="TEXT", default="Security Exposure Report")
-    parser.add_argument("--report-brand", metavar="TEXT", default="site-audit")
-    parser.add_argument("--report-logo", metavar="URL", default=None)
-    parser.add_argument("--discover-subdomains", action="store_true")
-    parser.add_argument("--no-save-last", action="store_true")
-    parser.add_argument("--last-scope", choices=["user", "project", "both"], default="both")
+    parser = build_parser(exit_on_error=False)
+    parser.set_defaults(workers=default_workers)
 
     export_parser = argparse.ArgumentParser(exit_on_error=False, add_help=False)
     export_parser.add_argument("output")
@@ -2976,27 +3162,12 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
     export_parser.add_argument("--report-brand", metavar="TEXT", default="site-audit")
     export_parser.add_argument("--report-logo", metavar="URL", default=None)
 
-    prefs = load_preferences()
-    prefs_scope = "both"
-
-    state: InteractiveState = {
-        "mode": "audit",
-        "profile": "standard",
-        "format": "json",
-        "output": None,
-        "min_severity": "INFO",
-        "workers": default_workers,
-        "timeout": TIMEOUT,
-        "time_budget": None,
-        "retries": RETRIES,
-        "insecure": False,
-        "fail_on": None,
-        "verbose": False,
-        "log_file": None,
-        "report_title": "Security Exposure Report",
-        "report_brand": "site-audit",
-        "report_logo": None,
-    }
+    initial_args = initial_args or parse_args([])
+    prefs = {} if initial_args.no_load_prefs else load_preferences()
+    prefs_scope = initial_args.prefs_scope
+    state: InteractiveState = {key: getattr(initial_args, key, PREF_DEFAULTS[key]) for key in PREF_KEYS}
+    state["workers"] = default_workers
+    state["_provided"] = set(getattr(initial_args, "_provided", set()))
     apply_preferences_to_state(state, prefs)
     history: list[str] = []
     history_path = _os.path.join(_os.path.expanduser("~"), ".site_audit_history")
@@ -3025,7 +3196,7 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
             print()
             continue
         except EOFError:
-            print("\nGraceful exit triggered. Byeeee!")
+            print("\nBye.")
             break
 
         if not line:
@@ -3036,16 +3207,19 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
         if line.lower() in ("help", "?", "h"):
             print(INTERACTIVE_HELP)
             continue
+        if line.lower() in ("version", "--version"):
+            print(f"{APP_NAME} {__version__}")
+            continue
 
         if history_enabled:
             # Keep runtime history array updated for the 'history' command to read
-            history.append(line)
+            history.append(redact_history_line(line))
             
             # Only write to file manually if we aren't using prompt_toolkit's FileHistory
             if not HAS_PROMPT_TOOLKIT:
                 try:
                     with open(history_path, "a", encoding="utf-8") as fh:
-                        fh.write(line + "\n")
+                        fh.write(redact_history_line(line) + "\n")
                 except OSError:
                     pass
 
@@ -3058,7 +3232,7 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
             continue
 
         try:
-            tokens = shlex.split(line)
+            tokens = split_interactive_line(line)
         except ValueError as exc:
             print(f"Parse error: {exc}")
             continue
@@ -3111,7 +3285,7 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
                 print("No history yet.")
             else:
                 for idx, entry in enumerate(history_list[-50:], start=max(1, len(history_list) - 49)):
-                    print(f"{idx:>4}: {entry}")
+                    print(f"{idx:>4}: {redact_history_line(entry)}")
             continue
 
         if command == "export":
@@ -3133,14 +3307,15 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
             if not output_path:
                 print("[ERROR] Export requires an output path")
                 continue
-            exit_code = export_last_report(
-                output_path,
-                output_format,
-                export_args.export_scope,
-                report_title=export_args.report_title,
-                report_brand=export_args.report_brand,
-                report_logo=export_args.report_logo,
-            )
+            try:
+                exit_code = export_last_report(
+                    output_path, output_format, export_args.export_scope,
+                    report_title=export_args.report_title, report_brand=export_args.report_brand,
+                    report_logo=export_args.report_logo,
+                )
+            except (OSError, ValueError, TypeError):
+                print("[ERROR] Export failed; check report data and file permissions")
+                exit_code = 1
             print(f"Export exit code: {exit_code}")
             continue
 
@@ -3155,10 +3330,12 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
             except (ValueError, TypeError) as exc:
                 print(f"Set error: {exc}")
                 continue
-            print(f"Set {normalized} = {value}")
+            display = redacted_url(value) if normalized == "proxy" else value
+            print(f"Set {normalized} = {display}")
             try:
                 prefs = update_preferences_from_state(prefs, state)
-                save_preferences(prefs, prefs_scope)
+                if not initial_args.no_save_prefs:
+                    save_preferences(prefs, prefs_scope)
             except OSError:
                 print("[WARN] Failed to save preferences")
             continue
@@ -3175,7 +3352,8 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
             print(f"Unset {normalized}")
             try:
                 prefs = update_preferences_from_state(prefs, state)
-                save_preferences(prefs, prefs_scope)
+                if not initial_args.no_save_prefs:
+                    save_preferences(prefs, prefs_scope)
             except OSError:
                 print("[WARN] Failed to save preferences")
             continue
@@ -3205,28 +3383,34 @@ def interactive_mode(default_workers: int, history_enabled: bool = False) -> Non
 
         if "://" not in scan_url and not scan_url.startswith("-"):
             scan_url = "https://" + scan_url
-            print(c("INFO", f"  (assumed https:// — use full URL to override)"))
+            print(c("INFO", "  (assumed https:// - use full URL to override)"))
 
         tokens = build_interactive_tokens(scan_url, state, extra_tokens)
 
         try:
             args = parser.parse_args(tokens)
+            record_provided_options(args, parser, tokens)
+            args.no_save_prefs = args.no_save_prefs or initial_args.no_save_prefs
+            args.no_save_last = args.no_save_last or initial_args.no_save_last
+            for key in ("basic_user", "basic_pass", "basic_pass_env", "bearer_token", "bearer_token_env", "cookie", "headers", "dry_run", "last_scope", "prefs_scope"):
+                if key not in args._provided:
+                    setattr(args, key, getattr(initial_args, key))
         except (argparse.ArgumentError, SystemExit) as exc:
-            print(f"Parse error: {exc}  — type 'help' for usage")
+            print(f"Parse error: {exc} - type 'help' for usage")
             continue
 
         try:
             exit_code = run_scan(args)
             print(f"Exit code: {exit_code}")
         except KeyboardInterrupt:
-            print("\n[+] Graceful exit triggered. Scan aborted. Use 'exit' to quit the application.")
+            print("\n[INFO] Scan interrupted; enter another target or 'exit'.")
         except Exception as exc:
             print(f"\n[!] Unexpected scan error: {exc}")
 
 
 def main() -> None:
     args = parse_args()
-    prefs = load_preferences()
+    prefs = {} if args.no_load_prefs else load_preferences()
 
     if getattr(args, "export_last", False):
         if not args.output:
@@ -3236,18 +3420,22 @@ def main() -> None:
         if not output_path:
             print("[ERROR] --output is required when using --export-last")
             raise SystemExit(1)
-        code = export_last_report(
-            output_path,
-            output_format,
-            getattr(args, "export_scope", "both"),
-            report_title=args.report_title,
-            report_brand=args.report_brand,
-            report_logo=args.report_logo,
-        )
+        try:
+            code = export_last_report(
+                output_path,
+                output_format,
+                getattr(args, "export_scope", "both"),
+                report_title=args.report_title,
+                report_brand=args.report_brand,
+                report_logo=args.report_logo,
+            )
+        except (OSError, ValueError, TypeError, KeyError):
+            print("[ERROR] Could not export report; check report contents and file permissions", file=sys.stderr)
+            code = 1
         raise SystemExit(code)
 
     if args.url is None:
-        interactive_mode(default_workers=args.workers, history_enabled=args.history)
+        interactive_mode(default_workers=args.workers, history_enabled=args.history, initial_args=args)
         return
 
     if not getattr(args, "no_load_prefs", False):
@@ -3258,6 +3446,10 @@ def main() -> None:
     except KeyboardInterrupt:
         print("\nInterrupted.")
         code = 130
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"[ERROR] {type(exc).__name__}: operation failed; check configuration and file permissions", file=sys.stderr)
+        LOGGER.debug("Scan failed", exc_info=True)
+        code = 1
     if not getattr(args, "no_save_prefs", False) and code in (0, 2):
         prefs = update_preferences_from_args(prefs, args)
         try:

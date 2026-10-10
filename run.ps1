@@ -11,11 +11,13 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $venv = "$root\.venv"
 $venvPython = "$venv\Scripts\python.exe"
 $reqFile = "$root\requirements.txt"
+$dependencyStamp = "$venv\.site-audit-dependencies.json"
+$pythonCommand = if (Test-Path $venvPython) { $venvPython } else { "python" }
 
 # 1. Check Python availability
 Write-Status "Verifying Python 3.10+..." INFO
 try {
-    $pyVersion = & python --version 2>&1
+    $pyVersion = & $pythonCommand --version 2>&1
     if ($LASTEXITCODE -ne 0) {
         throw "Python not found in PATH"
     }
@@ -37,7 +39,7 @@ try {
 # 2. Create/validate venv
 if (-not (Test-Path $venvPython)) {
     Write-Status "Creating virtual environment in .venv..." INFO
-    & python -m venv $venv
+    & $pythonCommand -m venv $venv
     if ($LASTEXITCODE -ne 0) {
         Write-Status "Failed to create venv" ERROR
         exit 1
@@ -50,21 +52,28 @@ if (Test-Path $reqFile) {
     
     # Test if core modules load so we only run pip if necessary (much faster startup)
     $depsOk = $true
+    $requirementsHash = (Get-FileHash -LiteralPath $reqFile -Algorithm SHA256).Hash
     try {
-        $null = & $venvPython -c "import requests, bs4, prompt_toolkit, pypac" 2>&1
+        $stamp = Get-Content -LiteralPath $dependencyStamp -Raw -ErrorAction Stop | ConvertFrom-Json
+        if ($stamp.requirementsHash -ne $requirementsHash) { $depsOk = $false }
+    } catch {
+        $depsOk = $false
+    }
+    try {
+        $null = & $venvPython -c "import requests, bs4, prompt_toolkit, pypac, tldextract, defusedxml; from urllib3.response import HTTPResponse; assert hasattr(HTTPResponse, 'read1')" 2>&1
         if ($LASTEXITCODE -ne 0) { $depsOk = $false }
     } catch {
         $depsOk = $false
     }
     
     if (-not $depsOk) {
-        Write-Status "Installing missing dependencies..." INFO
-        & $venvPython -m pip install --quiet --upgrade pip
+        Write-Status "Installing or updating required dependencies..." INFO
         & $venvPython -m pip install --quiet -r $reqFile
         if ($LASTEXITCODE -ne 0) {
             Write-Status "Dependency installation failed! Check pip output." ERROR
             exit 1
         }
+        @{ requirementsHash = $requirementsHash } | ConvertTo-Json | Set-Content -LiteralPath $dependencyStamp -Encoding UTF8
     }
     Write-Status "Environment ready" INFO
 }

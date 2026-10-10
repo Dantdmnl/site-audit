@@ -76,7 +76,7 @@ class ValidationTests(unittest.TestCase):
     def test_normalize_base_url(self) -> None:
         self.assertEqual(
             site_audit.normalize_base_url("example.com/app"),
-            "https://example.com/app/",
+            "https://example.com/app",
         )
 
         with self.assertRaisesRegex(ValueError, "Only http and https"):
@@ -113,7 +113,7 @@ class OutputWriterTests(unittest.TestCase):
                 findings=[finding],
             )
 
-            self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["tool"]["version"], "1.0.0")
+            self.assertEqual(json.loads(json_path.read_text(encoding="utf-8"))["tool"]["version"], site_audit.__version__)
 
             with csv_path.open(newline="", encoding="utf-8") as fh:
                 rows = list(csv.DictReader(fh))
@@ -124,7 +124,7 @@ class OutputWriterTests(unittest.TestCase):
             self.assertEqual(root.findtext("./finding/severity"), "HIGH")
 
             html = html_path.read_text(encoding="utf-8")
-            self.assertIn("site-audit v1.0.0", html)
+            self.assertIn(f"site-audit v{site_audit.__version__}", html)
 
 
 class RuntimeBehaviorTests(unittest.TestCase):
@@ -185,7 +185,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
         )
 
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "site-audit 1.0.0")
+        self.assertEqual(result.stdout.strip(), f"site-audit {site_audit.__version__}")
 
     def test_cli_dry_run_report_contains_version_and_makes_no_requests(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -202,6 +202,7 @@ class RuntimeBehaviorTests(unittest.TestCase):
                     str(report_path),
                     "--no-save-prefs",
                     "--no-save-last",
+                    "--no-load-prefs",
                 ],
                 cwd=ROOT,
                 text=True,
@@ -210,13 +211,14 @@ class RuntimeBehaviorTests(unittest.TestCase):
             )
 
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertIn("site-audit v1.0.0", result.stdout)
+            self.assertIn(f"site-audit v{site_audit.__version__}", result.stdout)
             self.assertIn("[DRY-RUN] Skipping endpoint audits", result.stdout)
             self.assertNotIn("Scanning 2 ports", result.stdout)
 
             payload = json.loads(report_path.read_text(encoding="utf-8"))
-            self.assertEqual(payload["tool"], {"name": "site-audit", "version": "1.0.0"})
-            self.assertEqual(payload["schema_version"], "1.0")
+            self.assertEqual(payload["tool"], {"name": "site-audit", "version": site_audit.__version__})
+            self.assertEqual(payload["schema_version"], site_audit.REPORT_SCHEMA_VERSION)
+            self.assertEqual(payload["scan"]["status"], "dry_run")
 
     def test_cli_invalid_header_fails_before_scan(self) -> None:
         result = subprocess.run(

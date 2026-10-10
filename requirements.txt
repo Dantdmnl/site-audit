@@ -1,4 +1,8 @@
-requests
-beautifulsoup4
-prompt_toolkit
-pypac
+requests>=2.32.4,<3
+urllib3>=2.8,<3
+beautifulsoup4>=4.12.3,<5
+soupsieve>=2.9,<3
+defusedxml>=0.7.1,<1
+prompt_toolkit>=3.0.48,<4
+pypac>=0.17,<1
+tldextract>=5.3,<6
